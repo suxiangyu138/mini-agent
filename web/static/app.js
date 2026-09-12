@@ -63,50 +63,471 @@
     new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
 
   // ==================================================================== 文本渲染
+  //
+  // 分三层：**块级 → 行内 → 公式**。
+  //
+  // 一条贯穿始终的硬规则：模型输出的文字一律先转义再进 DOM。
+  // 全文件只有一处 innerHTML（在 inlineHtml 里），它能成立是因为进去的字符串
+  // 已经过 escapeHtml，之后只加回 <code>/<strong>/<a> 三种自己写死的标签。
+  // 公式刻意不走这条路 —— KaTeX 直接往 DOM 节点里写，不产生 HTML 字符串，
+  // 所以「反正是 KaTeX 生成的」这种信任不需要建立。
+  //
+  // 不做完整 CommonMark，只认模型真会写出来的那几种。
+  // 但**容错优先于严格**：围栏没闭合、表格列数不齐、语言名写成 py，
+  // 都要渲染出一个说得过去的结果，而不是把后面的内容整段吞掉。
 
   const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
   const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ESCAPES[c]);
 
-  /** 行内标记：代码、加粗、链接。**入参必须先转义**，这里只负责套标签。 */
-  function inline(escaped) {
-    return escaped
-      .replace(/`([^`\n]+)`/g, '<code>$1</code>')
-      .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
-      .replace(
-        /(https?:\/\/[^\s<>()]+)/g,
-        '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>'
-      );
+  /** 行内标记：代码、加粗、链接。入参是**原始文本**，转义在这一步做。 */
+  function inlineHtml(raw) {
+    // 先按行内代码切开：代码段原样留着，其余部分才做加粗和链接。
+    // 不切的话 `**x**` 会被后面的加粗规则二次加工成 <code><strong>x</strong></code>。
+    return escapeHtml(raw)
+      .split(/(`[^`\n]+`)/)
+      .map((part) =>
+        part.length > 2 && part.startsWith('`') && part.endsWith('`')
+          ? '<code>' + part.slice(1, -1) + '</code>'
+          : part
+              .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+              .replace(
+                /(https?:\/\/[^\s<>()]+)/g,
+                '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>'
+              )
+      )
+      .join('')
+      .replace(/\n/g, '<br>');
   }
 
-  /** 极简 markdown：只认围栏代码块、段落、行内代码/加粗/链接——够用就好。 */
+  // ---- 公式 ----
+  //
+  // 四种定界符，两种含义：$...$ 和 \(...\) 是行内公式，$$...$$ 和 \[...\] 独立成行。
+  //
+  // 最容易误判的是**货币符号**：模型答「约合 670.82 元」时写 $100 是常事，
+  // 一旦把那个 $ 当成公式开头，后面半段话会被整个吞进去。
+  // 所以 $ 后面紧跟数字或空白的一律不当公式开头。
+
+  /** 找 from 之后 closer 的位置；allowNewline 为假时不跨行。 */
+  function closeAt(text, from, closer, allowNewline) {
+    const at = text.indexOf(closer, from);
+    if (at < 0 || allowNewline) return at;
+    const newline = text.indexOf('\n', from);
+    return newline >= 0 && newline < at ? -1 : at;
+  }
+
+  /** 行内公式的收尾 $：不能跨行，前面不能是空格，后面不能还是 $。 */
+  function inlineEnd(text, from) {
+    for (let i = from; i < text.length; i++) {
+      if (text[i] === '\n') return -1; // 不跨行，否则落单的 $ 能吞掉半个回答
+      if (text[i] === '\\') i++; // \$ 是字面量
+      else if (text[i] === '$' && !/\s/.test(text[i - 1]) && text[i + 1] !== '$') return i;
+    }
+    return -1;
+  }
+
+  /**
+   * 把原始文本切成「普通文本」和「公式」交替的片段。
+   * 从左到右扫一遍，每个位置按**长定界符优先**试（$$ 要先于 $ 判）。
+   */
+  function splitMath(raw) {
+    const text = String(raw);
+    const pieces = [];
+    let plain = '';
+    let i = 0;
+
+    const flush = () => {
+      if (plain) pieces.push({ text: plain });
+      plain = '';
+    };
+
+    while (i < text.length) {
+      let tex = null;
+      let display = false;
+      let end = i;
+
+      // 行内代码里的 $ 是字面量，整段原样跳过 —— 不跳的话 `$x$` 会被渲染成公式，
+      // 而代码的语义恰恰是「照原样显示」。
+      if (text[i] === '`') {
+        const close = text.indexOf('`', i + 1);
+        const newline = text.indexOf('\n', i + 1);
+        if (close > i && (newline < 0 || close < newline)) {
+          plain += text.slice(i, close + 1);
+          i = close + 1;
+          continue;
+        }
+      }
+
+      if (text.startsWith('$$', i)) {
+        // 独立公式可以跨多行 —— 模型经常写成 $$\n...\n$$，中间那几个换行要一起吃掉
+        const close = closeAt(text, i + 2, '$$', true);
+        if (close > i + 2) {
+          tex = text.slice(i + 2, close);
+          display = true;
+          end = close + 2;
+        }
+      } else if (text.startsWith('\\[', i)) {
+        const close = closeAt(text, i + 2, '\\]', true);
+        if (close > i + 2) {
+          tex = text.slice(i + 2, close);
+          display = true;
+          end = close + 2;
+        }
+      } else if (text.startsWith('\\(', i)) {
+        const close = closeAt(text, i + 2, '\\)', false);
+        if (close > i + 2) {
+          tex = text.slice(i + 2, close);
+          end = close + 2;
+        }
+      } else if (text[i] === '$' && text[i - 1] !== '\\') {
+        const next = text[i + 1];
+        // 货币符号保护：$ 后面是空白或又是 $ 的，一律不是公式开头
+        const blocked = next === undefined || next === '$' || /\s/.test(next);
+        if (!blocked) {
+          const close = inlineEnd(text, i + 1);
+          if (close > i + 1) {
+            const body = text.slice(i + 1, close);
+            // $ 后面紧跟数字，绝大多数时候是金额（$100）。但也有真的以数字
+            // 开头的公式（$778{,}516.9$）。两者用「内容里有没有 LaTeX 记号」分：
+            // 金额里不会出现 \ { } ^ _，而公式里几乎总有。
+            if (!/\d/.test(next) || /[\\{}^_]/.test(body)) {
+              tex = body;
+              end = close + 1;
+            }
+          }
+        }
+      }
+
+      const body = tex === null ? '' : tex.trim();
+      if (!body) {
+        // 不是公式开头。\x 整体当字面量跳过，免得 \$ 里那个 $ 又被当成定界符。
+        if (text[i] === '\\' && i + 1 < text.length) {
+          plain += text.slice(i, i + 2);
+          i += 2;
+        } else {
+          plain += text[i];
+          i += 1;
+        }
+        continue;
+      }
+
+      flush();
+      pieces.push({ tex: body, display });
+      i = end;
+    }
+
+    flush();
+    return pieces;
+  }
+
+  /**
+   * 一个公式 → 一个 DOM 节点。**不走 innerHTML**：KaTeX 自己往节点里写。
+   *
+   * 渲染失败一律降级成源码：宁可让用户看见 \frac{1}{2} 这样的原文，
+   * 也不能显示一堆红字或者干脆空白 —— 原文至少还读得懂，空白就什么信息都没了。
+   * KaTeX 没加载出来（离线、CDN 被拦）走的是同一条降级路径。
+   */
+  function mathNode(tex, display) {
+    const node = document.createElement('span');
+    node.className = display ? 'math math-display' : 'math';
+
+    if (window.katex && typeof window.katex.render === 'function') {
+      try {
+        window.katex.render(tex, node, {
+          displayMode: display,
+          throwOnError: true, // 出错要抛出来，抛了我们才接得住、才好降级
+          strict: false, // 模型写点非标准 LaTeX 也认，别动不动就报错
+          trust: false, // 关掉 \href / \htmlClass 这类能往属性里塞东西的命令
+          maxSize: 12, // 挡住 \Huge 之类把行高撑爆的尺寸命令
+        });
+        node.dataset.tex = tex; // 悬停看得见原始 LaTeX，方便复制去别处
+        return node;
+      } catch (error) {
+        node.classList.add('math-error');
+        node.title = '公式渲染失败：' + (error && error.message ? error.message : error);
+      }
+    } else {
+      node.classList.add('math-error');
+      node.title = 'KaTeX 没加载成功（离线或 CDN 被拦），这里显示的是公式源码';
+    }
+
+    node.textContent = (display ? '$$' : '$') + tex + (display ? '$$' : '$');
+    return node;
+  }
+
+  /** 行内内容 → DOM 片段：文本走「转义 + 白名单标签」，公式交给 KaTeX。 */
+  function inlineNodes(raw) {
+    const frag = document.createDocumentFragment();
+    for (const piece of splitMath(raw)) {
+      if (piece.tex === undefined) {
+        const holder = document.createElement('span');
+        holder.innerHTML = inlineHtml(piece.text);
+        while (holder.firstChild) frag.appendChild(holder.firstChild);
+        continue;
+      }
+      frag.appendChild(mathNode(piece.tex, piece.display));
+    }
+    return frag;
+  }
+
+  // ---- 块级 ----
+
+  const FENCE_OPEN = /^\s{0,3}(`{3,}|~{3,})\s*(.*?)\s*$/;
+  const FENCE_CLOSE = /^\s{0,3}(`{3,}|~{3,})\s*$/;
+  const INFO_TOKEN = /^[A-Za-z0-9_+#.-]{1,20}/;
+  const HEADING = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/;
+  const HR = /^\s{0,3}([-*_])\s*(?:\1\s*){2,}$/;
+  const QUOTE = /^\s{0,3}>\s?(.*)$/;
+  //: 列表标记单独捕获成一组：renderList 要拿它算正文缩进在哪一列。
+  //: 两个正则的组位置因此是平行的：1=缩进 2=标记 3=标记后的空白 4=正文。
+  const BULLET = /^(\s*)([-*+])(\s+)(.*)$/;
+  const NUMBERED = /^(\s*)(\d{1,9})([.)])(\s+)(.*)$/;
+  //: 表格分隔行：|---|:--:|---|，两头的竖线可省
+  const TABLE_SEP = /^\s*\|?\s*:?-{1,}:?\s*(?:\|\s*:?-{1,}:?\s*)*\|?\s*$/;
+
+  //: 语言别名归一化。模型写 py / js / sh 都很常见，统一成规范名，
+  //: 代码块右上角那个标签才不至于一会儿 py 一会儿 python。
+  const LANG_ALIAS = {
+    py: 'python', python3: 'python', python2: 'python',
+    js: 'javascript', node: 'javascript', mjs: 'javascript', cjs: 'javascript',
+    ts: 'typescript', sh: 'bash', shell: 'bash', zsh: 'bash', console: 'bash',
+    yml: 'yaml', md: 'markdown', rs: 'rust', kt: 'kotlin', golang: 'go',
+    'c++': 'cpp', cxx: 'cpp', 'c#': 'csharp', cs: 'csharp', rb: 'ruby',
+    ps1: 'powershell', htm: 'html', text: 'text', txt: 'text',
+  };
+
+  /** 围栏代码块。语言名只取首token，后面跟的 title="..." 之类直接忽略。 */
+  function codeBlock(body, lang) {
+    const raw = (lang || '').toLowerCase();
+    const name = LANG_ALIAS[raw] || raw;
+
+    const pre = document.createElement('pre');
+    const code = document.createElement('code');
+    code.textContent = body;
+    if (name) {
+      code.className = 'language-' + name;
+      pre.dataset.lang = name; // 右上角那个小标签读它（见 style.css）
+    }
+    pre.appendChild(code);
+    return pre;
+  }
+
+  /** 按未转义的 | 切单元格；\| 是格子里的字面竖线。 */
+  function splitRow(line) {
+    const text = line.trim().replace(/^\||\|$/g, '');
+    const cells = [];
+    let cell = '';
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] === '\\' && text[i + 1] === '|') {
+        cell += '|';
+        i++;
+      } else if (text[i] === '|') {
+        cells.push(cell);
+        cell = '';
+      } else {
+        cell += text[i];
+      }
+    }
+    cells.push(cell);
+    return cells.map((c) => c.trim());
+  }
+
+  /**
+   * 表格。分隔行决定每列的对齐。
+   * **列数不齐是常态**（模型经常少写或多写一格），所以一律以表头列数为准：
+   * 多的截掉、少的补空格子，绝不让后面的行整体错位。
+   */
+  function renderTable(frag, lines, start) {
+    const head = splitRow(lines[start]);
+    const aligns = splitRow(lines[start + 1]).map((cell) => {
+      const left = cell.startsWith(':');
+      const right = cell.endsWith(':');
+      return left && right ? 'center' : right ? 'right' : left ? 'left' : '';
+    });
+
+    const table = document.createElement('table');
+    const headRow = table.createTHead().insertRow();
+    head.forEach((cell, index) => {
+      const th = document.createElement('th');
+      if (aligns[index]) th.style.textAlign = aligns[index];
+      th.appendChild(inlineNodes(cell));
+      headRow.appendChild(th);
+    });
+
+    const body = table.createTBody();
+    let i = start + 2;
+    while (i < lines.length && lines[i].trim() && lines[i].includes('|')) {
+      const cells = splitRow(lines[i]);
+      const row = body.insertRow();
+      for (let c = 0; c < head.length; c++) {
+        const td = row.insertCell();
+        if (aligns[c]) td.style.textAlign = aligns[c];
+        td.appendChild(inlineNodes(cells[c] === undefined ? '' : cells[c]));
+      }
+      i++;
+    }
+
+    // 宽表格自己横向滚，不能把整页撑出横向滚动条
+    const wrap = document.createElement('div');
+    wrap.className = 'table-wrap';
+    wrap.appendChild(table);
+    frag.appendChild(wrap);
+    return i;
+  }
+
+  /**
+   * 有序 / 无序列表。
+   *
+   * 每条的内容**反缩进后递归渲染**，所以嵌套列表、列表里放代码块、
+   * 引用里套列表都不用单独写代码 —— 递归下去自然就对了。
+   */
+  function renderList(frag, lines, start, ordered) {
+    const ITEM = ordered ? NUMBERED : BULLET;
+    const list = document.createElement(ordered ? 'ol' : 'ul');
+
+    // 从模型给的第一个序号开始（从 3 开始的列表就显示 3、4、5）
+    const first = Number(ITEM.exec(lines[start])[2]);
+    if (ordered && first > 1) list.start = first;
+
+    let i = start;
+    while (i < lines.length && ITEM.test(lines[i])) {
+      const matched = ITEM.exec(lines[i]);
+      const indent = matched[1].length;
+      // 正文列 = 缩进 + 标记宽 + 一个空格；有序列表的标记宽是「数字 + 点」
+      const marker = ordered
+        ? matched[2].length + matched[3].length
+        : matched[2].length;
+      const column = indent + marker + 1;
+
+      const body = [ordered ? matched[5] : matched[4]];
+      i++;
+      while (i < lines.length) {
+        const line = lines[i];
+        const at = line.search(/\S/);
+        if (at < 0) {
+          // 空行后面还跟着这个列表的内容就继续，否则列表到此为止
+          const next = lines[i + 1];
+          if (next === undefined || (!ITEM.test(next) && next.search(/\S/) < indent)) break;
+          body.push('');
+          i++;
+          continue;
+        }
+        if (at === indent && ITEM.test(line)) break; // 同级的下一条
+        if (at < column) break; // 缩进不够，列表结束
+        body.push(line.slice(column));
+        i++;
+      }
+
+      const li = document.createElement('li');
+      li.appendChild(renderRich(body.join('\n')));
+      list.appendChild(li);
+    }
+
+    frag.appendChild(list);
+    return i;
+  }
+
+  /** 这一行是不是某个块的开头（段落循环靠它决定在哪断开）。 */
+  function startsBlock(lines, i) {
+    const line = lines[i];
+    if (FENCE_OPEN.test(line) || HEADING.test(line) || HR.test(line)) return true;
+    if (QUOTE.test(line) || BULLET.test(line) || NUMBERED.test(line)) return true;
+    return line.includes('|') && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1]);
+  }
+
+  /** markdown → DOM 片段。一次扫一遍行，按行首特征决定这块是什么。 */
   function renderRich(text) {
     const frag = document.createDocumentFragment();
-    String(text)
-      .split(/```/)
-      .forEach((part, index) => {
-        if (index % 2 === 1) {
-          // 奇数段落是围栏里的内容，第一行可能是语言名
-          const newline = part.indexOf('\n');
-          const head = newline >= 0 ? part.slice(0, newline).trim() : '';
-          const isLang = /^[\w+#.-]{0,16}$/.test(head);
-          const body = newline >= 0 && isLang ? part.slice(newline + 1) : part;
-          const pre = document.createElement('pre');
-          const code = document.createElement('code');
-          code.textContent = body.replace(/\n$/, '');
-          pre.appendChild(code);
-          frag.appendChild(pre);
-          return;
+    const lines = String(text).replace(/\r\n?/g, '\n').split('\n');
+    let i = 0;
+
+    while (i < lines.length) {
+      const line = lines[i];
+
+      // ---- 围栏代码块 ----
+      const open = FENCE_OPEN.exec(line);
+      if (open) {
+        const marker = open[1][0];
+        const size = open[1].length;
+        const info = INFO_TOKEN.exec(open[2]);
+        const body = [];
+        i++;
+        // 找不到收尾就一直吃到文末：回答被 max_tokens 截断时，
+        // 剩下半个代码块按代码显示才对，不该被当成正文。
+        while (i < lines.length) {
+          const close = FENCE_CLOSE.exec(lines[i]);
+          if (close && close[1][0] === marker && close[1].length >= size) break;
+          body.push(lines[i]);
+          i++;
         }
-        part.split(/\n{2,}/).forEach((block) => {
-          if (!block.trim()) return;
-          const p = document.createElement('p');
-          // 这里是全文件唯一一处 innerHTML，安全性由 escapeHtml 保证：
-          // 先转义掉所有 & < > " '，再只加回 <code>/<strong>/<a> 三种固定标签。
-          // 用户的链接也进不到属性里做坏事——引号在转义阶段已经变成实体了。
-          p.innerHTML = inline(escapeHtml(block)).replace(/\n/g, '<br>');
-          frag.appendChild(p);
-        });
-      });
+        i++;
+        frag.appendChild(codeBlock(body.join('\n'), info ? info[0] : ''));
+        continue;
+      }
+
+      // ---- 标题 ----
+      const heading = HEADING.exec(line);
+      if (heading) {
+        const node = document.createElement('h' + heading[1].length);
+        node.appendChild(inlineNodes(heading[2]));
+        frag.appendChild(node);
+        i++;
+        continue;
+      }
+
+      // ---- 分隔线（必须排在列表前面，否则「- - -」会被当成列表项）----
+      if (HR.test(line)) {
+        frag.appendChild(document.createElement('hr'));
+        i++;
+        continue;
+      }
+
+      if (!line.trim()) {
+        i++;
+        continue;
+      }
+
+      // ---- 表格 ----
+      if (line.includes('|') && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1])) {
+        i = renderTable(frag, lines, i);
+        continue;
+      }
+
+      // ---- 引用 ----
+      if (QUOTE.test(line)) {
+        const inner = [];
+        while (i < lines.length && lines[i].trim() && (QUOTE.test(lines[i]) || inner.length)) {
+          const quoted = QUOTE.exec(lines[i]);
+          inner.push(quoted ? quoted[1] : lines[i]);
+          i++;
+        }
+        const node = document.createElement('blockquote');
+        node.appendChild(renderRich(inner.join('\n'))); // 引用里可以有列表和代码块
+        frag.appendChild(node);
+        continue;
+      }
+
+      // ---- 列表 ----
+      if (BULLET.test(line)) {
+        i = renderList(frag, lines, i, false);
+        continue;
+      }
+      if (NUMBERED.test(line)) {
+        i = renderList(frag, lines, i, true);
+        continue;
+      }
+
+      // ---- 段落（兜底）----
+      const para = [line];
+      i++;
+      while (i < lines.length && lines[i].trim() && !startsBlock(lines, i)) {
+        para.push(lines[i]);
+        i++;
+      }
+      const p = document.createElement('p');
+      p.appendChild(inlineNodes(para.join('\n')));
+      frag.appendChild(p);
+    }
+
     return frag;
   }
 

@@ -6,7 +6,34 @@
 <meta name="color-scheme" content="light">
 <title>Mini-Agent</title>
 <link rel="icon" href="/favicon.ico">
+
+<!--
+  KaTeX 是整个项目唯一的外部依赖，说明一下为什么不自己写：
+
+  公式排版不是「画得出来就行」——上下标位置、分式线粗细、积分号大小、
+  根号的高度和倾斜，整套是 TeX 的排版规则，自己实现等于重写一个 TeX。
+  服务端渲染也不行：这个项目只依赖标准库，装不了 Python 的 LaTeX 绑定。
+
+  几条约束：
+  · 版本钉死 + SRI 哈希。CDN 被投毒或被中间人改写时浏览器会直接拒绝执行，
+    这跟本项目在 Host / Origin 上的防御姿态是一致的。
+  · defer 加载，且**不加**到 app.js 上：CDN 慢或不通时界面照常能用，
+    只是公式降级成源码显示（见 app.js 的 mathNode）。
+  · 字体跟着 CSS 从同一个 CDN 取，不用另配。
+-->
 <link rel="stylesheet" href="/static/style.css">
+<link
+  rel="stylesheet"
+  href="https://cdn.jsdelivr.net/npm/katex@0.18.7/dist/katex.min.css"
+  integrity="sha384-JctiRyLzXCrSoOOzFlSoWLdyzQl7OrrRnhyeBmzB6ZWtcjccUyc8lCQJqIbs3uQX"
+  crossorigin="anonymous"
+>
+<script
+  defer
+  src="https://cdn.jsdelivr.net/npm/katex@0.18.7/dist/katex.min.js"
+  integrity="sha384-+7Keh381hSkXmXqnjC0JBM/kzsN6TFj+wMKychSLjTvJ8/0ElMde2uKl8i6p6Buj"
+  crossorigin="anonymous"
+></script>
 </head>
 <body>
 

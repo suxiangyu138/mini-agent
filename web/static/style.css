@@ -226,6 +226,109 @@ body:hover ::-webkit-scrollbar-thumb { background: rgba(24, 24, 27, 0.14); }
 }
 .prose pre code { padding: 0; border: 0; background: none; font-size: 12.8px; line-height: 1.65; }
 
+/* 代码块的语言标签：模型标了语言就把它摆在右上角。
+   不做语法高亮 —— 那要引一整套词法着色器（Shiki 一兆起步），
+   和「无框架、无构建、一个文件读完」冲突，收益只是好看而已。 */
+.prose pre[data-lang] { position: relative; padding-top: 26px; }
+.prose pre[data-lang]::before {
+  content: attr(data-lang);
+  position: absolute; top: 7px; right: 12px;
+  font-family: var(--mono); font-size: 10.5px;
+  color: var(--fg-3);
+  letter-spacing: 0.04em;
+  pointer-events: none;
+}
+
+/* ---- 标题：都比空状态那个 22px 的 h1 小，正文里的标题不该抢主标题 ---- */
+
+.prose h1, .prose h2, .prose h3, .prose h4, .prose h5, .prose h6 {
+  margin: 20px 0 8px;
+  font-weight: 600;
+  line-height: 1.45;
+  letter-spacing: -0.005em;
+}
+.prose h1 { font-size: 19px; }
+.prose h2 { font-size: 17px; }
+.prose h3 { font-size: 15.5px; }
+.prose h4, .prose h5, .prose h6 { font-size: 15px; color: var(--fg-2); }
+
+/* ---- 列表 ---- */
+
+.prose ul, .prose ol { margin: 0 0 12px; padding-left: 22px; }
+.prose li { margin: 3px 0; }
+.prose li > ul, .prose li > ol { margin: 3px 0; }
+/* 项目符号比正文淡一档，免得一列圆点比内容还显眼 */
+.prose li::marker { color: var(--fg-3); }
+
+/* ---- 引用 ---- */
+
+.prose blockquote {
+  margin: 0 0 12px;
+  padding: 1px 0 1px 14px;
+  border-left: 2px solid var(--line-strong);
+  color: var(--fg-2);
+}
+.prose blockquote > *:last-child { margin-bottom: 0; }
+
+/* ---- 分隔线 ---- */
+
+.prose hr {
+  margin: 18px 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+/* ---- 表格 ---- */
+
+/* 外层负责横向滚动。宽表格撑破 720px 列会连累整页出现横向滚动条，
+   所以让它自己在自己的框里滚。 */
+.table-wrap { margin: 0 0 12px; overflow-x: auto; }
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums; /* 数字列上下对齐 */
+}
+.prose th, .prose td {
+  padding: 7px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+/* 表头和数据都用满墨：表格往往就是答案本身（汇率、参数、对比），
+   压淡了就成了「次要信息」。表头靠字重和那条重一档的线区分，不靠颜色。 */
+.prose th {
+  font-weight: 600;
+  color: var(--fg);
+  border-bottom-color: var(--line-strong);
+  white-space: nowrap;
+}
+.prose td { color: var(--fg); }
+.prose tbody tr:last-child td { border-bottom: 0; }
+.prose th:first-child, .prose td:first-child { padding-left: 0; }
+.prose th:last-child, .prose td:last-child { padding-right: 0; }
+
+/* ---- 公式 ---- */
+
+.prose .katex { font-size: 1.12em; } /* KaTeX 默认 1.21em，比正文大一圈，收一点回来 */
+/* 独立公式用 block 而不是 <div>：这样即使它出现在段落中间，HTML 嵌套也是合法的 */
+.math-display { display: block; margin: 0 0 12px; overflow-x: auto; overflow-y: hidden; }
+.math-display .katex-display { margin: 0; }
+.math[data-tex] { cursor: help; }
+
+/* 渲染失败时显示的是 LaTeX 源码。用等宽 + 淡红底标出来，
+   但**不隐藏**：公式没渲染出来的时候，源码本身就是最有用的信息。 */
+.math-error {
+  font-family: var(--mono); font-size: 0.88em;
+  color: var(--danger);
+  background: var(--danger-soft);
+  padding: 1px 5px; border-radius: 5px;
+  overflow-wrap: anywhere;
+}
+
+/* 各种块的首元素不要带上外边距，否则每段回答顶上都会空一块 */
+.prose > *:first-child { margin-top: 0; }
+
 /* ---- 工具调用：默认收成一行，想知道细节再展开 ---- */
 
 .tool {

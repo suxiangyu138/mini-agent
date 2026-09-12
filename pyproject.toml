@@ -49,6 +49,8 @@ words = [
     # 公共 API 工具用到的服务名
     "openalex", "crossref", "pubmed", "coingecko", "frankfurter", "openlibrary",
     "nager", "meteo", "zippopotam", "er-api", "wmo",
+    # 前端：公式排版库及其 CDN
+    "katex", "jsdelivr", "woff",
 ]
 # config.example.json 里的占位 Key 是给人看格式的，不参与拼写检查。
 ignorePaths = ["config.example.json", ".env.example"]

@@ -78,6 +78,7 @@ def _hostname_of(value: str) -> str:
         return ""
     return (urlsplit(f"//{value}").hostname or "").lower()
 
+
 #: 空状态给的建议问题：**每条都挂一个它真正会用到的工具**，工具没注册就不出现。
 #: 第一屏就让人看见 ReAct 在干活（真的去调了工具），比任何说明文字都直观。
 SUGGESTIONS: tuple[tuple[str, str], ...] = (
@@ -305,9 +306,7 @@ class ChatSession:
             "stream": self.config.stream,
             "workspace": self.config.workspace_dir,
             "turns": self.turns,
-            "suggestions": [
-                q for q, tool in SUGGESTIONS if tool in tools
-            ][:_MAX_SUGGESTIONS],
+            "suggestions": [q for q, tool in SUGGESTIONS if tool in tools][:_MAX_SUGGESTIONS],
         }
 
     # ---------- 跑一轮 ----------

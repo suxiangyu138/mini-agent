@@ -1,0 +1,29 @@
+{
+  "_说明": "复制成 config.json 即可生效。优先级：环境变量 > 本文件 > 代码默认值。API Key 建议放环境变量或 .env，不要写进这里（尤其别提交到 git）。",
+
+  "provider": "anthropic",
+  "model": "",
+  "base_url": "",
+  "max_tokens": 16000,
+  "timeout": 60.0,
+
+  "max_steps": 8,
+  "max_identical_calls": 3,
+  "stream": true,
+
+  "max_turns": 20,
+  "max_context_chars": 60000,
+
+  "workspace_dir": "./workspace",
+  "allow_file_write": true,
+  "max_tool_result_chars": 8000,
+  "http_allow_private": false,
+  "_http_allowed_hosts说明": "域名白名单：即使在保留网段也放行。本机代理软件开 fake-ip 时所有域名都会被解析成 198.18.x.x，用这个精准放行需要的域名，比开 http_allow_private 安全得多。",
+  "http_allowed_hosts": [],
+  "enabled_tools": [],
+  "disabled_tools": [],
+
+  "verbose": false,
+  "log_file": "",
+  "system_prompt_extra": ""
+}

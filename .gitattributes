@@ -1,0 +1,10 @@
+# 行尾统一成 LF，两种平台 clone 下来都是同一份内容。
+# 不写这个的话，Windows 上 core.autocrlf=true 会在每次 checkout 时把工作区的
+# 文本换成 CRLF，任何一次提交的 diff 都会变成「整个文件都改了」。
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.gz binary
+*.zip binary

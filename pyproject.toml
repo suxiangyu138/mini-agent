@@ -1,0 +1,51 @@
+[project]
+name = "mini-agent"
+version = "0.1.0"
+description = "一个可运行、可扩展、结构清晰的通用 Agent 框架（ReAct + 工具调用 + 可插拔模型层）"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.40",
+    "requests>=2.28",
+    'tzdata>=2024.1; platform_system == "Windows"',
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "RUF"]
+# 注释、文档字符串和给模型看的提示词都是中文，全角标点是刻意的。
+# RUF001/2/3 会把「，」「：」报成「有歧义的 Unicode」，这里关掉。
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+# 工具类用类属性声明三要素（name/description/parameters），
+# 这是给模型看的常量 Schema，不打算实例化时修改，因此允许可变默认值。
+# 测试里的假工具（EchoTool 等）同理。
+"agent/tools/*.py" = ["RUF012"]
+"tests/*.py" = ["RUF012"]
+# 包的 __all__ 是按四层架构分组排列的，读起来能看出层次，不按字母序重排。
+"agent/__init__.py" = ["RUF022"]
+
+[tool.pyright]
+# 工具是插件式接口：基类 run(**kwargs) 是给注册中心统一调用的，
+# 各工具用自己具名的关键字参数（run(expression) / run(path, ...)）更易读，
+# 这里关掉「子类签名必须兼容基类」的检查，而不是给每个工具加 type: ignore。
+reportIncompatibleMethodOverride = "none"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.cspell]
+# 厂商名、模型名和领域缩写不是拼错的英文单词，编辑器别一条条标红。
+words = [
+    "zhipu", "bigmodel", "dashscope", "tongyi", "qwen", "kimi", "moonshot",
+    "deepseek", "minimax", "minimaxi", "xiaomi", "xiaomimimo", "mimo", "ollama",
+    "tavily", "ssrf", "ttft", "sse", "jsonl",
+]
+# config.example.json 里的占位 Key 是给人看格式的，不参与拼写检查。
+ignorePaths = ["config.example.json", ".env.example"]

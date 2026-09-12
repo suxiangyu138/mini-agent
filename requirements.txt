@@ -1,0 +1,12 @@
+# Mini-Agent 运行依赖
+#
+# 说明：两个 SDK 都是「可选」的——不用哪个厂商就不用装哪个。
+#   * 用 provider=anthropic  → 需要 anthropic
+#   * 用 provider=openai/deepseek/qwen/moonshot/zhipu/ollama → 需要 requests
+#   * 用 provider=mock（离线演示/测试）→ 两个都不需要
+
+anthropic>=0.40          # Claude 官方 SDK（provider=anthropic）
+requests>=2.28           # OpenAI 兼容协议 + HTTP/搜索工具
+
+# Windows 上 zoneinfo 需要 IANA 时区库；Linux/macOS 系统自带，不装也没事
+tzdata>=2024.1; platform_system == "Windows"

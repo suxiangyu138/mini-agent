@@ -1,0 +1,486 @@
+/* Mini-Agent 界面样式
+ *
+ * 设计约束（来自界面设计要求）：
+ *   极简亮色 · 单一强调色 · 文字三级层次 92/62/40% 墨 · 720px 居中列
+ *   统一 12px 圆角 · 150–250ms ease-out 淡入 + 上浮 8px · 呼吸点代替转圈
+ *   极细滚动条 · 空状态给建议问题 · 时间戳悬停才出现
+ *
+ * 亮色比暗色难做的地方在于「层次」：暗色靠一层层加亮区分平面，亮色只能靠
+ * **极淡的描边 + 大而虚的阴影**。所以这里没有用纯白打底（纯白 + 纯白 = 没有层次），
+ * 页面底是暖灰白，卡片才是纯白，两者差一口气，加上阴影才立得起来。
+ *
+ * 没有构建步骤，也没有 CSS 框架：全部样式就在这一个文件里，改完刷新即可。
+ */
+
+:root {
+  /* 页面底（暖灰白）→ 卡片/气泡（纯白）→ 两级悬停。越靠上越白。 */
+  --bg: #f5f5f3;
+  --surface: #ffffff;
+  --surface-2: #f2f2ef;
+  --surface-3: #ebebe7;
+
+  --line: rgba(24, 24, 27, 0.09);
+  --line-strong: rgba(24, 24, 27, 0.17);
+
+  /* 文字三级层次：92 / 64 / 46% 墨。
+     比暗色的 90/60/40 各抬了一点 —— 同样的 40%，墨压浅底比白压深底看着淡得多，
+     照搬过来最下面那一级会糊到读不清。层次感保留，绝对值按对比度重定。 */
+  --fg: rgba(24, 24, 27, 0.92);
+  --fg-2: rgba(24, 24, 27, 0.64);
+  --fg-3: rgba(24, 24, 27, 0.46);
+
+  /* 唯一强调色。用量克制：只在「正在发生」和「关键数字」上出现 */
+  --accent: #2f5fe0;
+  --accent-ink: #ffffff; /* 压在强调色上的字/图标 */
+  --accent-soft: rgba(47, 95, 224, 0.08);
+  --accent-line: rgba(47, 95, 224, 0.32);
+  /* 亮底上的红要压深，否则对比度不够、看着发飘 */
+  --danger: #c0392b;
+  --danger-soft: rgba(192, 57, 43, 0.08);
+
+  /* 阴影只做两件事：让卡片浮起来、让焦点区域收拢。一律大而虚，看得见形状但说不出颜色 */
+  --shadow-sm: 0 1px 2px rgba(24, 24, 27, 0.04), 0 1px 1px rgba(24, 24, 27, 0.03);
+  --shadow-md: 0 1px 2px rgba(24, 24, 27, 0.04), 0 10px 24px -18px rgba(24, 24, 27, 0.28);
+  --shadow-lg: 0 2px 6px rgba(24, 24, 27, 0.06), 0 28px 60px -28px rgba(24, 24, 27, 0.3);
+
+  --radius: 12px;
+  --radius-sm: 8px;
+  --col: 720px;
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --dur: 0.2s;
+
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --mono: "SF Mono", "JetBrains Mono", Menlo, Consolas, "Cascadia Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+/* JS 用 `.hidden = true` 控制显隐。下面那些 display:grid/flex 的规则优先级和 UA 的
+   [hidden] 一样高、又写在后面，不加这一条按钮根本藏不住。 */
+[hidden] { display: none !important; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* 滚动条：平时几乎看不见，指上去才显形 */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 99px;
+  transition: background var(--dur) var(--ease);
+}
+body:hover ::-webkit-scrollbar-thumb { background: rgba(24, 24, 27, 0.14); }
+::-webkit-scrollbar-thumb:hover { background: rgba(24, 24, 27, 0.26); }
+* { scrollbar-width: thin; scrollbar-color: rgba(24, 24, 27, 0.14) transparent; }
+
+/* 键盘焦点要看得见（鼠标点击不显示） */
+:focus-visible {
+  outline: 2px solid var(--accent-line);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* ---------------------------------------------------------------- 骨架 */
+
+.app {
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px max(20px, calc((100vw - var(--col)) / 2));
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: color-mix(in srgb, var(--bg) 92%, transparent);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid transparent;
+  transition: border-color var(--dur) var(--ease);
+}
+.topbar.scrolled { border-bottom-color: var(--line); }
+
+.brand { display: flex; align-items: center; gap: 9px; }
+.brand .mark {
+  width: 8px; height: 8px; border-radius: 3px;
+  background: var(--accent);
+  /* 暗色里那个发光效果挪到亮底上会糊成一团脏色，亮色改用一圈淡环收边 */
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.brand .name { font-size: 14px; font-weight: 600; letter-spacing: 0.01em; }
+
+.topbar-right { display: flex; align-items: center; gap: 4px; }
+
+.chip {
+  display: inline-flex; align-items: center; gap: 7px;
+  height: 28px; padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  color: var(--fg-2);
+  font-size: 12px;
+  font-family: var(--mono);
+  max-width: 42vw;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.chip .pulse {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--fg-3);
+  flex: none;
+  transition: background var(--dur) var(--ease);
+}
+.chip.live .pulse { background: var(--accent); animation: breathe 1.6s var(--ease) infinite; }
+
+.ghost {
+  height: 28px; padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-3);
+  font-family: inherit; font-size: 12.5px;
+  cursor: pointer;
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.ghost:hover { color: var(--fg); background: var(--surface-2); }
+
+/* ---------------------------------------------------------------- 消息流 */
+
+.stream {
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0 20px;
+  scroll-behavior: smooth;
+}
+@media (prefers-reduced-motion: reduce) { .stream { scroll-behavior: auto; } }
+
+.stream > * { max-width: var(--col); margin-inline: auto; }
+
+.turns { padding-bottom: 28px; }
+
+.turn { animation: rise 0.22s var(--ease) both; }
+.turn + .turn { margin-top: 30px; }
+
+/* ---- 用户 ---- */
+
+.msg-user {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 18px;
+}
+.msg-user .bubble {
+  max-width: 85%;
+  padding: 9px 14px;
+  border-radius: var(--radius) var(--radius) 4px var(--radius);
+  /* 暗色里气泡靠「比底色亮一档」浮起来，亮色里浅一档几乎看不见（试过 #ebebe7，
+     整个气泡糊在背景里），所以改成和工具卡片同一套办法：白底 + 描边 + 淡阴影 */
+  background: var(--surface);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ---- 助手 ---- */
+
+.msg-bot { display: flex; flex-direction: column; gap: 10px; }
+
+.prose { overflow-wrap: anywhere; }
+/* 流式期间是纯文本，得自己保住换行；整段说完才换成渲染好的富文本 */
+.prose.streaming { white-space: pre-wrap; }
+.prose p { margin: 0 0 12px; }
+.prose p:last-child { margin-bottom: 0; }
+.prose strong { font-weight: 600; }
+.prose a { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--accent-line); }
+.prose code {
+  font-family: var(--mono); font-size: 0.88em;
+  padding: 1.5px 5px; border-radius: 5px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+.prose pre {
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow-x: auto;
+}
+.prose pre code { padding: 0; border: 0; background: none; font-size: 12.8px; line-height: 1.65; }
+
+/* ---- 工具调用：默认收成一行，想知道细节再展开 ---- */
+
+.tool {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+  animation: rise 0.2s var(--ease) both;
+}
+.tool > summary {
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 12px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 12.5px;
+  color: var(--fg-2);
+  transition: background var(--dur) var(--ease);
+}
+.tool > summary::-webkit-details-marker { display: none; }
+.tool > summary:hover { background: var(--surface-2); }
+.tool .tdot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); flex: none;
+}
+.tool[data-error="true"] .tdot { background: var(--danger); }
+.tool .tname { font-family: var(--mono); color: var(--fg); }
+.tool .targs {
+  flex: 1; min-width: 0;
+  color: var(--fg-3);
+  font-family: var(--mono); font-size: 11.5px;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.tool .ttime { color: var(--fg-3); font-family: var(--mono); font-size: 11.5px; flex: none; }
+.tool .tbody {
+  border-top: 1px solid var(--line);
+  padding: 10px 12px;
+  background: var(--bg);
+}
+.tool .tbody pre {
+  margin: 0;
+  font-family: var(--mono); font-size: 12px; line-height: 1.6;
+  color: var(--fg-2);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 260px; overflow-y: auto;
+}
+.tool .tbody .label {
+  font-size: 11px; color: var(--fg-3); letter-spacing: 0.04em;
+  text-transform: uppercase; margin-bottom: 5px;
+}
+.tool[data-error="true"] .tbody pre { color: var(--danger); }
+
+/* ---- 指标条：输入/输出 token、token 速度… ---- */
+
+.metrics {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 0;
+  font-family: var(--mono); font-size: 11.5px; color: var(--fg-3);
+  animation: rise 0.22s var(--ease) both;
+}
+.metrics .m {
+  display: inline-flex; align-items: baseline; gap: 4px;
+  padding: 0 9px;
+  border-left: 1px solid var(--line);
+}
+.metrics .m:first-child { padding-left: 0; border-left: 0; }
+.metrics .m b {
+  font-weight: 500; color: var(--fg-2);
+  font-variant-numeric: tabular-nums;
+}
+.metrics .m.accent b { color: var(--accent); }
+.metrics .m.accent .unit { color: var(--accent-line); }
+.metrics .m .unit { color: var(--fg-3); }
+.metrics .m.warn b { color: var(--danger); }
+
+/* 流式过程中那一条：带呼吸点，数字实时在跳 */
+.metrics.live { color: var(--fg-3); }
+.metrics.live .breathe {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--accent);
+  margin-right: 8px;
+  animation: breathe 1.6s var(--ease) infinite;
+}
+
+/* ---------------------------------------------------------------- 空状态 */
+
+.empty {
+  padding: clamp(48px, 16vh, 140px) 0 28px;
+  animation: rise 0.3s var(--ease) both;
+}
+.empty h1 {
+  margin: 0 0 8px;
+  font-size: 22px; font-weight: 600; letter-spacing: -0.01em;
+}
+.empty .sub { margin: 0 0 26px; color: var(--fg-2); font-size: 14px; }
+
+.suggestions { display: flex; flex-direction: column; gap: 7px; align-items: flex-start; }
+.suggestions button {
+  text-align: left;
+  padding: 9px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  color: var(--fg-2);
+  font-family: inherit; font-size: 13.5px;
+  cursor: pointer;
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease),
+    border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease),
+    transform var(--dur) var(--ease);
+}
+.suggestions button:hover {
+  color: var(--fg);
+  background: var(--surface);
+  border-color: var(--line-strong);
+  box-shadow: var(--shadow-md);
+  transform: translateY(-1px);
+}
+
+/* ---------------------------------------------------------------- 输入区 */
+
+.composer { padding: 10px 20px 18px; }
+
+.box {
+  max-width: var(--col);
+  margin-inline: auto;
+  display: flex; align-items: flex-end; gap: 6px;
+  padding: 7px 7px 7px 14px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+/* 聚焦时不再换底色（亮色下换底色反而像塌了一块），改成描边收深 + 阴影收紧 */
+.box:focus-within { border-color: var(--line-strong); box-shadow: var(--shadow-lg); }
+
+.box textarea {
+  flex: 1;
+  min-height: 26px; max-height: 200px;
+  padding: 4px 0;
+  border: 0; outline: 0; resize: none;
+  background: transparent;
+  color: var(--fg);
+  font-family: inherit; font-size: 15px; line-height: 1.6;
+}
+.box textarea::placeholder { color: var(--fg-3); }
+.box textarea:disabled { color: var(--fg-3); }
+
+.send, .stop {
+  flex: none;
+  width: 32px; height: 32px;
+  display: grid; place-items: center;
+  border: 0; border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background var(--dur) var(--ease), opacity var(--dur) var(--ease),
+    transform var(--dur) var(--ease);
+}
+.send { background: var(--accent); color: var(--accent-ink); box-shadow: var(--shadow-sm); }
+.send svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.send:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); }
+.send:disabled, .send.idle { background: var(--surface-3); color: var(--fg-3); box-shadow: none; cursor: default; transform: none; }
+
+.stop { background: var(--surface); border: 1px solid var(--line-strong); }
+.stop:hover { background: var(--danger-soft); border-color: var(--danger); }
+.stop .sq { width: 9px; height: 9px; border-radius: 2px; background: var(--danger); }
+
+.hint {
+  max-width: var(--col);
+  margin: 8px auto 0;
+  font-size: 11.5px; color: var(--fg-3);
+  min-height: 16px;
+}
+.hint kbd {
+  font-family: var(--mono); font-size: 10.5px;
+  padding: 1px 4px; border-radius: 4px;
+  background: var(--surface-2); border: 1px solid var(--line);
+}
+
+/* ---------------------------------------------------------------- 工具抽屉 */
+
+.sheet {
+  position: fixed; inset: 0; z-index: 20;
+  display: grid; place-items: center;
+  /* 亮色的遮罩不能用黑：黑压白会发灰发脏，用墨色低透明度 + 一点点虚化 */
+  background: rgba(24, 24, 27, 0.22);
+  backdrop-filter: blur(4px);
+  animation: fade 0.18s var(--ease) both;
+}
+.sheet-panel {
+  width: min(520px, calc(100vw - 40px));
+  max-height: min(70vh, 560px);
+  display: flex; flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  animation: rise 0.2s var(--ease) both;
+}
+.sheet-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 12px 12px 16px;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px; color: var(--fg-2);
+}
+.tool-list { margin: 0; padding: 8px; list-style: none; overflow-y: auto; }
+.tool-list li {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+.tool-list li:hover { background: var(--surface-2); }
+.tool-list .n { font-family: var(--mono); color: var(--fg); }
+
+/* ---------------------------------------------------------------- 时间戳 */
+
+.stamp {
+  font-family: var(--mono); font-size: 11px; color: var(--fg-3);
+  opacity: 0;
+  transition: opacity var(--dur) var(--ease);
+}
+.turn:hover .stamp { opacity: 1; }
+.msg-user .stamp { margin-right: 10px; align-self: center; }
+.msg-bot > .stamp { margin-top: -2px; }
+
+/* ---------------------------------------------------------------- 动效 */
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+/* 呼吸点：比转圈安静，不抢内容的注意力 */
+@keyframes breathe {
+  0%, 100% { opacity: 0.25; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* ---------------------------------------------------------------- 窄屏 */
+
+@media (max-width: 560px) {
+  body { font-size: 14.5px; }
+  .topbar { padding: 10px 14px; }
+  .stream { padding: 0 14px; }
+  .composer { padding: 8px 14px 14px; }
+  .chip { max-width: 34vw; }
+  .msg-user .bubble { max-width: 92%; }
+}

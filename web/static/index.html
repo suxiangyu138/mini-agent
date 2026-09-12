@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<title>Mini-Agent</title>
+<link rel="icon" href="/favicon.ico">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="mark"></span>
+      <span class="name">Mini-Agent</span>
+    </div>
+    <div class="topbar-right">
+      <span class="chip" id="model-chip" title="当前模型后端">
+        <span class="pulse"></span><span id="model-text">连接中…</span>
+      </span>
+      <button class="ghost" id="tools-btn" type="button" title="当前可用的工具">工具</button>
+      <button class="ghost" id="reset-btn" type="button" title="清空对话历史">清空</button>
+    </div>
+  </header>
+
+  <main class="stream" id="stream">
+    <section class="empty" id="empty">
+      <h1>今天想做点什么？</h1>
+      <p class="sub">我可以用工具去算、去查、去读写工作目录里的文件，而不是凭记忆猜。</p>
+      <div class="suggestions" id="suggestions"></div>
+    </section>
+    <div class="turns" id="turns"></div>
+  </main>
+
+  <footer class="composer">
+    <div class="box" id="box">
+      <textarea id="input" rows="1" placeholder="问点什么…" autocomplete="off" spellcheck="false"></textarea>
+      <button class="send" id="send" type="button" aria-label="发送">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h13M12 5.5 18.5 12 12 18.5"/></svg>
+      </button>
+      <button class="stop" id="stop" type="button" aria-label="停止" hidden>
+        <span class="sq"></span>
+      </button>
+    </div>
+    <div class="hint" id="hint"><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</div>
+  </footer>
+
+</div>
+
+<div class="sheet" id="sheet" hidden>
+  <div class="sheet-panel">
+    <div class="sheet-head">
+      <span>当前可用的工具</span>
+      <button class="ghost" id="sheet-close" type="button">关闭</button>
+    </div>
+    <ul class="tool-list" id="tool-list"></ul>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

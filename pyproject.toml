@@ -46,6 +46,9 @@ words = [
     "zhipu", "bigmodel", "dashscope", "tongyi", "qwen", "kimi", "moonshot",
     "deepseek", "minimax", "minimaxi", "xiaomi", "xiaomimimo", "mimo", "ollama",
     "tavily", "ssrf", "ttft", "sse", "jsonl",
+    # 公共 API 工具用到的服务名
+    "openalex", "crossref", "pubmed", "coingecko", "frankfurter", "openlibrary",
+    "nager", "meteo", "zippopotam", "er-api", "wmo",
 ]
 # config.example.json 里的占位 Key 是给人看格式的，不参与拼写检查。
 ignorePaths = ["config.example.json", ".env.example"]

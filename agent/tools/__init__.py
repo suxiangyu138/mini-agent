@@ -13,7 +13,22 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from . import calculator, datetime_tool, file_io, http, search
+from . import (
+    academic,
+    books,
+    calculator,
+    crypto,
+    datetime_tool,
+    exchange_rate,
+    file_io,
+    fun,
+    holidays,
+    http,
+    search,
+    tech_news,
+    weather,
+    world_bank,
+)
 from .base import BaseTool, ToolError, ToolRegistry, ToolResult
 
 logger = logging.getLogger(__name__)
@@ -27,12 +42,28 @@ __all__ = [
 ]
 
 #: 内置工具模块。想默认启用新工具，把它加进来就行。
+#:
+#: 后九个是「公共 API」那一组：全部**免 Key**，装好就能用，
+#: 主机名在各自模块里写死，模型没法把请求指到别处（见 :mod:`agent.tools.net`）。
+#: 每个工具的 Schema 都会跟着**每一次**请求发给模型，所以这一组的粒度是刻意压过的——
+#: 「OpenAlex / Crossref / PubMed」合成一个 ``academic_search`` 换 ``source`` 参数，
+#: 就是为了少带两份 Schema。再加工具前先想想能不能并进现有的。
 _BUILDERS = (
     calculator,
     datetime_tool,
     file_io,
     http,
     search,
+    # ---- 公共 API（免 Key）----
+    weather,
+    academic,
+    world_bank,
+    crypto,
+    exchange_rate,
+    tech_news,
+    books,
+    holidays,
+    fun,
 )
 
 

@@ -25,6 +25,7 @@ import json
 import logging
 import mimetypes
 import queue
+import socket
 import sys
 import threading
 import time
@@ -34,6 +35,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:  # 支持 `python web/server.py` 直接跑，不要求先 pip install -e .
@@ -51,16 +53,51 @@ INDEX_FILE = STATIC_DIR / "index.html"
 #: 正文长度上限，防止有人往接口里灌一兆的字符串
 MAX_BODY_BYTES = 64 * 1024
 
+#: 本机自己的名字，`Host` 校验用。进程启动时算一次就够。
+_LOCAL_NAMES = frozenset(
+    n
+    for n in (
+        "127.0.0.1",
+        "::1",
+        "localhost",
+        socket.gethostname().lower(),
+        socket.getfqdn().lower(),
+        socket.gethostname().lower().split(".")[0],
+    )
+    if n
+)
+
+
+def _hostname_of(value: str) -> str:
+    """从 ``Host`` / ``Origin`` 里剥出主机名：去端口、去 IPv6 方括号、转小写。
+
+    ``"[::1]:8000"`` → ``"::1"``；``"127.0.0.1:8000"`` → ``"127.0.0.1"``。
+    """
+    value = (value or "").strip()
+    if not value:
+        return ""
+    return (urlsplit(f"//{value}").hostname or "").lower()
+
 #: 空状态给的建议问题：**每条都挂一个它真正会用到的工具**，工具没注册就不出现。
 #: 第一屏就让人看见 ReAct 在干活（真的去调了工具），比任何说明文字都直观。
 SUGGESTIONS: tuple[tuple[str, str], ...] = (
-    ("今天几号？现在几点？", "get_current_time"),
+    ("杭州今天天气怎么样？要带伞吗？", "weather"),
     ("帮我算一下 (1234 * 5678) / 9 是多少", "calculator"),
+    ("1 美元等于多少人民币？", "exchange_rate"),
+    ("技术圈最近在聊什么？", "hacker_news"),
+    ("今年还剩哪些法定假期？", "holidays"),
+    # ↓ 以下几条是备选：上面凑不满 _MAX_SUGGESTIONS 条时才会露出来
+    ("比特币现在多少钱？", "crypto_price"),
+    ("中国最近几年的 GDP 走势如何？", "world_bank"),
+    ("今天几号？现在几点？", "get_current_time"),
     ("工作目录里现在有哪些文件？", "list_dir"),
     ("从 2024 年 1 月 1 日到今天过了多少天？", "date_diff"),
-    ("1 美元等于多少人民币？", "http_request"),
     ("最近有什么大模型相关的新闻？", "web_search"),
 )
+
+#: 空状态最多摆几条。它们是竖着一列排的，再多就把首屏撑满了——
+#: 「高级简洁」的第一条就是别一上来糊一屏字。
+_MAX_SUGGESTIONS = 5
 
 #: stop_reason → 给界面看的中文说法
 STOP_REASONS = {
@@ -268,7 +305,9 @@ class ChatSession:
             "stream": self.config.stream,
             "workspace": self.config.workspace_dir,
             "turns": self.turns,
-            "suggestions": [q for q, tool in SUGGESTIONS if tool in tools],
+            "suggestions": [
+                q for q, tool in SUGGESTIONS if tool in tools
+            ][:_MAX_SUGGESTIONS],
         }
 
     # ---------- 跑一轮 ----------
@@ -356,9 +395,63 @@ class Handler(BaseHTTPRequestHandler):
     def session(self) -> ChatSession:
         return self.server.session  # type: ignore[attr-defined]
 
+    # ---------- 同源校验 ----------
+    #
+    # 这个服务没有登录态，但**「本机 」不等于「只有我能访问」**：
+    #   1. DNS rebinding —— 恶意页面把自己的域名解析到 127.0.0.1，浏览器就会带着
+    #      攻击者的 Host 来访问本机端口，读走 /api/info、甚至直接驱动 Agent；
+    #   2. CSRF —— 页面虽读不到响应，但 ``fetch('http://127.0.0.1:8000/api/chat')``
+    #      这种「简单请求」根本不会触发预检，照样能把请求打到我们身上。
+    #
+    # 两道闸都靠**浏览器自己带的头**，不靠猜：Host 必须落在这台机器真实可被叫到的
+    # 名字里；POST 必须同源。两条都不影响 curl（它本来就不是被攻击的目标）。
+
+    def _allowed_hosts(self) -> set[str]:
+        """这台机器当前**可以**被叫到的名字。"""
+        names = set(_LOCAL_NAMES)
+        try:
+            # 客户端连过来的那个本机地址。绑 0.0.0.0 时它就是局域网 IP，
+            # 于是「局域网用 IP 访问」照常工作，而攻击者的域名仍然对不上。
+            names.add(str(self.connection.getsockname()[0]).lower())
+        except OSError:
+            pass
+        return names
+
+    def _guard(self, *, mutating: bool) -> bool:
+        """校验通过返回 True；不通过就回 403 并返回 False。"""
+        host = _hostname_of(self.headers.get("Host", ""))
+        if host not in self._allowed_hosts():
+            logger.warning("拒绝 Host=%r 的请求（疑似 DNS rebinding）", host)
+            self._send_json({"error": "Host 不被接受"}, status=403)
+            return False
+
+        if not mutating:
+            return True
+
+        # Sec-Fetch-Site 是新浏览器都会带的，先看它——它比 Origin 更难伪造。
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if site and site not in ("same-origin", "none"):
+            logger.warning("拒绝 Sec-Fetch-Site=%r 的写请求（疑似 CSRF）", site)
+            self._send_json({"error": "跨站请求被拒绝"}, status=403)
+            return False
+
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin or origin == "null":
+            # 没有 Origin：curl / 脚本，不是浏览器发的跨站请求。
+            # 浏览器对跨站 POST **一定**会带 Origin，所以缺它不构成 CSRF 通道。
+            return True
+        origin_host = _hostname_of(urlsplit(origin).netloc)
+        if origin_host and origin_host in self._allowed_hosts():
+            return True
+        logger.warning("拒绝 Origin=%r 的写请求（疑似 CSRF）", origin)
+        self._send_json({"error": "跨站请求被拒绝"}, status=403)
+        return False
+
     # ---------- 路由 ----------
 
     def do_GET(self) -> None:  # BaseHTTPRequestHandler 规定的名字就是大写下划线
+        if not self._guard(mutating=False):
+            return
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
             self._send_file(INDEX_FILE)
@@ -372,6 +465,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "没有这个路径"}, status=404)
 
     def do_POST(self) -> None:
+        if not self._guard(mutating=True):
+            return
         path = self.path.split("?", 1)[0]
         if path == "/api/chat":
             self._chat()

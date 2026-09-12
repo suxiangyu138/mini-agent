@@ -33,10 +33,11 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -121,6 +122,28 @@ TITLE_MAX_CHARS = 24
 
 #: 清空全部会话时，界面上要求输入的那四个字。服务端也校验一遍。
 CONFIRM_WORD = "确认删除"
+
+#: 密钥的形状。有的厂商鉴权失败时会把 key 原样写进错误正文，而我们**要把错误原文
+#: 发给浏览器**——这条消息会进 DOM，用户截个图就跟着走了。所以发出去之前先抹一遍。
+#: 只认 ``sk-`` 和 ``Bearer`` 两种开头：写宽了会误伤正常报错里的普通单词。
+_KEY_SHAPE = re.compile(r"\b(sk-[A-Za-z0-9_\-]{8,}|Bearer\s+[A-Za-z0-9_\-.]{8,})")
+
+
+def redact(text: str, secrets: Iterable[str] = ()) -> str:
+    """抹掉一段文字里的密钥。
+
+    两道，因为各有各的漏法：
+
+    1. **配置里那几个真的 key**——最准，但只认我们知道的；
+    2. **形状规则**——厂商回显、第三方库自己拼出来的字符串，我们不一定认识。
+
+    报错本身不抹：把 ``AuthenticationError: invalid api key`` 换成「处理请求时出错」，
+    等于把唯一有用的排查线索扔了，而这是个跑在本机、只有自己看的服务。
+    """
+    for secret in secrets:
+        if secret and len(secret) >= 8:
+            text = text.replace(secret, "***")
+    return _KEY_SHAPE.sub("***", text)
 
 
 class SessionError(Exception):
@@ -276,6 +299,10 @@ class Session:
             return
         self._emit("step", step_payload(record))
 
+    def _secrets(self) -> list[str]:
+        """配置里有哪几个密钥 —— 报错要走浏览器之前先按这个抹一遍。"""
+        return [str(getattr(self.config, name, "") or "") for name in ("api_key", "search_api_key")]
+
     # ------------------------------------------------------------------ #
     # 控制
     # ------------------------------------------------------------------ #
@@ -352,7 +379,8 @@ class Session:
 
                 if "error" in box:
                     self._persist(agent)  # 跑挂了也要留下已经发生过的那部分对话
-                    yield "error", {"message": f"{type(box['error']).__name__}: {box['error']}"}
+                    detail = f"{type(box['error']).__name__}: {box['error']}"
+                    yield "error", {"message": redact(detail, self._secrets())}
                 else:
                     result: AgentResult = box["result"]
                     self.turns += 1
@@ -457,7 +485,10 @@ class Session:
                 continue
             written.append(fact.to_dict())
         if written:
-            logger.info("记下 %d 条长期记忆：%s", len(written), written[0]["content"][:40])
+            # 只记条数，不记内容：长期记忆是用户本人的事（姓名、偏好、在做的项目），
+            # 写进日志就等于把它复制到了另一个没有加密、还可能被顺手贴出去的地方。
+            # 要看具体记了什么，界面上有记忆页。
+            logger.info("记下 %d 条长期记忆", len(written))
             self.refresh_facts(target)
         return written
 

@@ -139,7 +139,9 @@ class Config:
     allow_file_write: bool = True
     max_tool_result_chars: int = 8000
     http_allow_private: bool = False
-    # 白名单：这些域名即使在保留网段也放行（本机代理开 fake-ip 时的精准解法）
+    # 白名单：这些域名即使在保留网段也放行（子域名自动跟着放行）。
+    # fake-ip 代理环境已由 agent/tools/http.py 自动处理，这里留给「域名合法但确实
+    # 解析到内网」的情况。
     http_allowed_hosts: list[str] = field(default_factory=list)
     search_api_key: str = ""
     enabled_tools: list[str] = field(default_factory=list)

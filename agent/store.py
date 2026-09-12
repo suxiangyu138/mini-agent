@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -216,6 +217,18 @@ def default_db_path() -> Path:
     return Path("./data/memory.db")
 
 
+def _chmod(path: Path, mode: int) -> None:
+    """尽力收权限。收不了就算了 —— 不该为了一个权限位把开库整个搞失败。
+
+    收不了是常态，不是异常：Windows 的 ``os.chmod`` 只能拨只读位；
+    某些文件系统（FAT、部分网络盘）压根没有权限这回事。
+    """
+    try:
+        os.chmod(path, mode)
+    except OSError:  # pragma: no cover - 取决于平台和文件系统
+        logger.debug("收不了 %s 的权限，跳过", path)
+
+
 class Store:
     """一堆会话 + 一堆事实，落在同一个 SQLite 文件里。
 
@@ -227,7 +240,7 @@ class Store:
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = str(path if path is not None else default_db_path())
         if self.path != ":memory:":
-            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+            self._prepare_dir(Path(self.path).parent)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -242,6 +255,31 @@ class Store:
             self._conn.executescript(_SCHEMA)
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._conn.commit()
+        if self.path != ":memory:":
+            # 文件这时候才真的存在（``connect`` 建的），所以收权限要放在这之后。
+            _chmod(self.path, 0o600)
+
+    @staticmethod
+    def _prepare_dir(parent: Path) -> None:
+        """建库文件所在目录，顺手把权限收成「只有本人」。
+
+        **收权限只在目录是我们自己建的时候做**——如果用户把 ``--db`` 指到一个
+        已经存在的目录（项目根、家目录……），那目录里的东西不归我们管，
+        改它的权限是越界。自己建的（默认就是 ``./data/``）才收。
+
+        收目录比收文件划算：WAL 那两个兄弟文件（``-wal``/``-shm``）是第一次
+        写入时才冒出来的，一个个 chmod 追不上；目录 0700 之后，里面的文件
+        不管什么权限，别人都进不来。
+
+        **Windows 上这一整套基本是空转**：``os.chmod`` 只能拨只读位，设不出
+        ACL，那边的权限本来就继承自用户目录。写在这里是为了 Linux/macOS——
+        那些地方默认 umask 022，不设的话库文件是「同机器上谁都能读」，
+        而里面是完整的对话记录。
+        """
+        if parent.exists():
+            return
+        parent.mkdir(parents=True, exist_ok=True)
+        _chmod(parent, 0o700)
 
     def close(self) -> None:
         with self._lock:

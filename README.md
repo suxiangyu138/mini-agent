@@ -247,10 +247,10 @@ AI / 大模型
 - **关键词按词边界匹配**。`ai` 不能命中 said / email / chair，`ml` 不能命中 html / xml
   ——误判会直接摆到主页上，比少推一条难看得多。词表见 `web/hot.py`。
 
-> **前提是 `http_request` 真能读到原文。** 开着代理 fake-ip 模式时读链接会整体失败
-> （见 §9），此时 Agent 会如实说明没读到原文——不会编，但成色打折。**不能靠「把推送
-> 的域名自动加白名单」绕过**：热点域名每小时都在变，而且 HN 是用户投稿站，
-> 那等于让陌生人决定你本机能访问哪些地址。
+> **前提是 `http_request` 真能读到原文。** 开着代理 fake-ip 模式时，域名会被解析成
+> `198.18.x.x` 占位地址——这种情况现在是放行的（见 §9），读链接不受影响。真要出问题
+> 只剩两种：代理没开却还在用假地址（连不上，工具会提示这一点），或者没有 `http_request`
+> 的权限范围。无论哪种，Agent 都会如实说明没读到原文，不会凭记忆编。
 
 ### 2.8 记忆与会话
 
@@ -314,7 +314,7 @@ API Key **绝不出现在代码里**，只从环境变量（或 `.env` / `config
 | `workspace_dir` | `MINI_AGENT_WORKSPACE` | `./workspace` | 文件工具的活动范围（沙箱根目录） |
 | `allow_file_write` | `MINI_AGENT_ALLOW_FILE_WRITE` | `true` | 关掉就只剩只读 |
 | `http_allow_private` | `MINI_AGENT_HTTP_ALLOW_PRIVATE` | `false` | 是否允许访问内网地址（慎用，等于全放开） |
-| `http_allowed_hosts` | `MINI_AGENT_HTTP_ALLOWED_HOSTS` | 空 | 域名白名单：即使解析到保留网段也放行（代理 fake-ip 环境用，逗号分隔） |
+| `http_allowed_hosts` | `MINI_AGENT_HTTP_ALLOWED_HOSTS` | 空 | 域名白名单：即使解析到保留网段也放行（子域名自动跟着放行，逗号分隔）。fake-ip 环境已自动处理，见 §9 |
 | `search_api_key` | `TAVILY_API_KEY` | 空 | 配了才启用 `web_search` |
 | `enabled_tools` | `MINI_AGENT_ENABLED_TOOLS` | 空 | 白名单（逗号分隔），非空时只留这些 |
 | `disabled_tools` | `MINI_AGENT_DISABLED_TOOLS` | 空 | 黑名单 |
@@ -553,11 +553,14 @@ python -m ruff format --check .      # 格式检查（和上一行是两件事�
   （涵盖 `169.254.169.254` 这类云元数据端点）。IP 字面量的检查**永远生效**，白名单也绕不过；
   要放开真内网只能显式设 `http_allow_private`。
 - **代理的 fake-ip 模式**：本机若开着 Clash/Surge 一类代理的 fake-ip，所有域名都会被解析成
-  `198.18.x.x`（RFC 2544 保留段），上面那条规则会把**每一个**域名都拦下。这时用
-  `http_allowed_hosts` 按域名放行（如 `example.com`，子域名自动跟着放行），
-  比直接开 `http_allow_private` 安全得多。更彻底的做法是在代理里把这些域名加进
-  `fake-ip-filter`，让它返回真实 IP。**§4 那九个公共 API 工具不受这条影响**——
-  它们的主机名写死在代码里，模型给不了 URL，走的也不是 `http_request` 的校验路径。
+  `198.18.x.x`（RFC 2544 保留段）。那是个**占位地址**，不对应任何真实主机，真实地址只有代理
+  知道——拿它做安全检查，检查的是一个假答案，结论只能是「每个域名都不许访问」。所以规则是：
+  **域名的解析结果全是 fake-ip 占位地址 → 放行，交给代理去路由**；只要拿到了真地址，就照旧
+  走全套检查。于是代理开着能用，关掉之后域名解析回真实 IP，同一套代码依旧把内网拦在外面，
+  两边都不用改配置。**IP 字面量不适用这条**：它不经过 DNS，写什么就是什么（`http://198.18.0.9/`
+  照样拒绝）。想让某个域名即使在保留网段也放行，仍可用 `http_allowed_hosts`。
+  **§4 那九个公共 API 工具不受这条影响**——它们的主机名写死在代码里，模型给不了 URL，
+  走的也不是 `http_request` 的校验路径。
 - **Web 界面校验同源**：本地服务没有登录态，但「在本机」不等于「只有我能访问」，
   所以两条都要挡：
   - **DNS rebinding**——恶意页面把自己的域名解析到 `127.0.0.1`，浏览器就会带着攻击者的

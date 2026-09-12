@@ -1,13 +1,20 @@
 /* Mini-Agent 前端
  *
- * 无框架、无构建，一个文件读完。和后端只有三个接口：
- *   GET  /api/info    界面启动时问一次当前配置和工具
- *   POST /api/chat    提问，响应是 SSE 流（text / step / done / error 四种事件）
- *   POST /api/cancel  中断正在跑的那一轮
+ * 无框架、无构建，一个文件读完。接口分四组：
+ *   GET  /api/info                     界面启动时问一次当前配置和工具
+ *   POST /api/chat                     提问，响应是 SSE 流（见 handleFrame）
+ *   POST /api/cancel                   中断正在跑的那一轮
+ *   GET  /api/sessions /api/session /api/context /api/memories /api/settings
+ *   POST /api/sessions/{new,select,rename,pin,delete,clear}
+ *        /api/memories/{add,update,delete,clear} · /api/settings · /api/reset
  *
- * 一条硬规则：**模型输出的文字一律先转义再进 DOM**。
- * 模型会把 http_request 抓回来的网页内容当上下文，那里面写什么都有可能，
- * 不转义就等于把 XSS 直接送到页面上。
+ * 两条硬规则：
+ *
+ * 1. **模型输出的文字一律先转义再进 DOM**。模型会把 http_request 抓回来的网页
+ *    内容当上下文，那里面写什么都有可能，不转义就等于把 XSS 直接送到页面上。
+ * 2. **一条 SSE 帧只能写进它自己那一轮**。done 之后输入框就解锁了，用户完全
+ *    可能在上一轮的收尾事件（记忆 / 压缩 / 上下文）还在路上时就开始下一轮；
+ *    渲染函数因此一律带 turn 参数，不认「当前那一轮」这个隐式状态。
  */
 
 (() => {
@@ -16,6 +23,7 @@
   const $ = (id) => document.getElementById(id);
 
   const el = {
+    app: $('app'),
     stream: $('stream'),
     turns: $('turns'),
     empty: $('empty'),
@@ -27,13 +35,36 @@
     modelText: $('model-text'),
     sheet: $('sheet'),
     toolList: $('tool-list'),
+    // 侧栏与各页
+    sideList: $('side-list'),
+    sideTabs: document.querySelectorAll('.side-tab'),
+    crumb: $('crumb'),
+    notice: $('notice'),
+    noticeText: $('notice-text'),
+    pageMemory: $('page-memory'),
+    pageSettings: $('page-settings'),
+    scrim: $('scrim'),
+    // 上下文状态
+    ctx: $('ctx'),
+    ctxLine: $('ctx-line'),
+    ctxText: $('ctx-text'),
+    ctxBar: $('ctx-bar'),
+    ctxDetail: $('ctx-detail'),
+    // 浮层
+    toastHost: $('toast-host'),
+    dialog: $('dialog'),
+    dialogPanel: $('dialog-panel'),
   };
 
   const state = {
-    info: { tools: [], suggestions: [] },
+    info: { tools: [], suggestions: [], settings: {} },
+    sessionId: '', // 页面上开着的那个会话。每一轮都带上它，避免写进别的会话
     running: false, // 正在跑一轮
-    turn: null, // 当前这一轮的可变引用
     pinned: true, // 用户是否还停在底部（自己往上翻了就别硬拽回来）
+    view: 'chat', // chat | memory | settings
+    sessions: { current: '', count: 0, groups: [] },
+    context: null, // 最近一次 /api/context 的结果
+    noticeTimer: 0,
   };
 
   // ==================================================================== 工具函数
@@ -541,11 +572,18 @@
     if (force || state.pinned) el.stream.scrollTop = el.stream.scrollHeight;
   }
 
+  /**
+   * 开一轮，返回这一轮的句柄。
+   *
+   * 句柄是**显式传下去**的，不放进 state 里当「当前那一轮」：done 之后输入框
+   * 就解锁了，用户可能在上一轮的收尾事件还没到齐时就开始下一轮，而「当前那一轮」
+   * 只有一个 —— 那时候上一轮的记忆卡片就会画到新一轮下面去。
+   */
   function makeTurn(question) {
     el.empty.hidden = true;
 
-    const turn = document.createElement('article');
-    turn.className = 'turn';
+    const node = document.createElement('article');
+    node.className = 'turn';
 
     const row = document.createElement('div');
     row.className = 'msg-user';
@@ -554,12 +592,12 @@
     bubble.className = 'bubble';
     bubble.textContent = question;
     row.appendChild(bubble);
-    turn.appendChild(row);
+    node.appendChild(row);
 
     const bot = document.createElement('div');
     bot.className = 'msg-bot';
     bot.setAttribute('aria-busy', 'true');
-    turn.appendChild(bot);
+    node.appendChild(bot);
 
     // 流式期间有个「正在发生」的指标行垫在最底下，新内容插在它前面，
     // 这样工具块和文字块的先后顺序自然就是它们真实发生的顺序。
@@ -567,10 +605,10 @@
     live.className = 'metrics live';
     bot.appendChild(live);
 
-    el.turns.appendChild(turn);
+    el.turns.appendChild(node);
 
-    state.turn = {
-      node: turn,
+    const turn = {
+      node,
       bot,
       live,
       prose: null, // 当前正在追加文字的段落块
@@ -579,9 +617,11 @@
       startedAt: performance.now(),
       firstAt: null,
       lastPaint: 0,
+      settled: false, // metrics 已经画过，后面的事件该往它下面追加
     };
-    paintLive();
+    paintLive(turn);
     scrollToEnd(true);
+    return turn;
   }
 
   function liveRow(t) {
@@ -599,8 +639,7 @@
     return row;
   }
 
-  function paintLive() {
-    const t = state.turn;
+  function paintLive(t) {
     if (!t) return;
     const now = performance.now();
     if (now - t.lastPaint < 90) return; // 别为了跳数字把主线程占满
@@ -611,8 +650,7 @@
   }
 
   /** 正文段落：第一段新建，之后往同一段里追加，直到来了一次工具调用把它「封口」。 */
-  function appendText(delta) {
-    const t = state.turn;
+  function appendText(t, delta) {
     if (!t) return;
     t.text += delta;
     t.chars += delta.length;
@@ -624,12 +662,11 @@
     // 流式期间只塞纯文本（textContent 不过 HTML 解析，最快也最安全），
     // 等这一段说完再整体换成渲染好的富文本 —— 见 sealProse()。
     t.prose.textContent = t.text;
-    paintLive();
+    paintLive(t);
     scrollToEnd();
   }
 
-  function sealProse() {
-    const t = state.turn;
+  function sealProse(t) {
     if (!t || !t.prose) return;
     t.prose.classList.remove('streaming');
     t.prose.replaceChildren(renderRich(t.text));
@@ -637,11 +674,8 @@
     t.text = '';
   }
 
-  function appendTool(step) {
-    const t = state.turn;
-    if (!t) return;
-    sealProse(); // 工具之后的文字属于新的一段，另起一块
-
+  /** 一个工具调用块。流式期间和从库里恢复历史都用它，两边长得一样。 */
+  function toolBox(step) {
     const box = document.createElement('details');
     box.className = 'tool';
     box.dataset.error = String(!!step.is_error);
@@ -660,9 +694,103 @@
     pre.textContent = step.result;
     body.appendChild(pre);
     box.appendChild(body);
+    return box;
+  }
 
-    t.bot.insertBefore(box, t.live);
+  function appendTool(t, step) {
+    if (!t) return;
+    sealProse(t); // 工具之后的文字属于新的一段，另起一块
+    t.bot.insertBefore(toolBox(step), t.live);
     scrollToEnd();
+  }
+
+  /**
+   * 一轮之后要追加的东西（记忆卡片、压缩提示）都走这里。
+   *
+   * 位置不一样：还在流式时新内容要插在「正在发生」那一行**前面**；
+   * done 之后那一行已经换成了指标行，新内容该在它**下面**——答案、指标、
+   * 然后才是「顺手记下了什么」。
+   */
+  function appendAfter(t, node) {
+    if (!t) return;
+    if (t.settled) t.bot.appendChild(node);
+    else t.bot.insertBefore(node, t.live);
+    scrollToEnd();
+  }
+
+  /**
+   * 「已记住」卡片。自动抽取是回答完之后才跑的，所以卡片一定出现在指标行下面，
+   * 而且带一个当场撤销的入口——用户看见它才知道刚才那句话被记下来了。
+   */
+  function renderMemo(t, facts) {
+    if (!t || !facts.length) return;
+    const box = document.createElement('div');
+    box.className = 'memo';
+
+    const head = document.createElement('div');
+    head.className = 'memo-head';
+    head.appendChild(icon('check'));
+    const label = document.createElement('span');
+    label.textContent = facts.length > 1 ? `记住了 ${facts.length} 条` : '记住了';
+    head.appendChild(label);
+    box.appendChild(head);
+
+    const list = document.createElement('ul');
+    list.className = 'memo-list';
+    for (const fact of facts) {
+      const item = document.createElement('li');
+      const cat = document.createElement('span');
+      cat.className = 'cat';
+      cat.textContent = fact.category_label || '其他';
+      const text = document.createElement('span');
+      text.className = 'text';
+      text.textContent = fact.content;
+      item.append(cat, text);
+      list.appendChild(item);
+    }
+    box.appendChild(list);
+
+    const foot = document.createElement('div');
+    foot.className = 'memo-foot';
+    const undo = document.createElement('button');
+    undo.type = 'button';
+    undo.className = 'link-btn';
+    undo.textContent = '撤销';
+    undo.addEventListener('click', async () => {
+      undo.disabled = true;
+      let failed = 0;
+      for (const fact of facts) {
+        try {
+          await postJSON('/api/memories/delete', { id: fact.id });
+        } catch {
+          failed++;
+        }
+      }
+      box.remove();
+      if (failed) toast(`有 ${failed} 条没撤销掉，可以去记忆页看看。`, { warn: true });
+      else toast('已经忘掉了，之后的回答不会再带上它。');
+    });
+    const view = document.createElement('button');
+    view.type = 'button';
+    view.className = 'link-btn';
+    view.textContent = '去记忆页看看';
+    view.addEventListener('click', () => showView('memory'));
+    foot.append(undo, view);
+    box.appendChild(foot);
+
+    appendAfter(t, box);
+  }
+
+  /** 历史被压成摘要了，说一声。用户有权知道早期对话不再逐字发给模型。 */
+  function renderCompressed(t, data) {
+    if (!t) return;
+    const row = document.createElement('div');
+    row.className = 'compressed';
+    row.appendChild(icon('layers'));
+    const text = document.createElement('span');
+    text.textContent = `对话变长了，早期内容已经压成 ${data.chars} 字摘要（原文仍在本地，往上翻还看得见）。`;
+    row.appendChild(text);
+    appendAfter(t, row);
   }
 
   function formatArgs(args) {
@@ -675,10 +803,9 @@
     return parts.join(' ');
   }
 
-  function renderMetrics(metrics) {
-    const t = state.turn;
+  function renderMetrics(t, metrics) {
     if (!t) return;
-    sealProse();
+    sealProse(t);
 
     const row = document.createElement('div');
     row.className = 'metrics';
@@ -719,20 +846,21 @@
 
     t.live.replaceWith(row);
     t.live = row;
+    t.settled = true;
     t.bot.setAttribute('aria-busy', 'false');
     t.node.appendChild(span('stamp', stamp()));
     scrollToEnd();
   }
 
-  function renderError(message) {
-    const t = state.turn;
+  function renderError(t, message) {
     if (!t) return;
-    sealProse();
+    sealProse(t);
     const row = document.createElement('div');
     row.className = 'metrics';
     row.appendChild(metric('', message, '', 'warn'));
     t.live.replaceWith(row);
     t.live = row;
+    t.settled = true;
     t.bot.setAttribute('aria-busy', 'false');
     scrollToEnd();
   }
@@ -748,10 +876,16 @@
     if (!running) el.input.focus();
   }
 
+  //: 每一轮一个号。done 之后输入框就解锁了，用户可能立刻开始下一轮，
+  //: 而上一轮的连接还要过一会儿才关 —— 收尾时靠它判断「我还是最新那一轮吗」，
+  //: 否则上一轮结束会把正在跑的这一轮标成「没在跑」。
+  let runSeq = 0;
+
   async function ask(question) {
     if (state.running || !question.trim()) return;
 
-    makeTurn(question);
+    const run = ++runSeq;
+    const turn = makeTurn(question);
     setRunning(true);
     el.input.value = '';
     autosize();
@@ -760,10 +894,11 @@
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: question }),
+        // 带上会话 id：页面上开着哪个会话，这一问就写进哪个。
+        body: JSON.stringify({ message: question, session: state.sessionId }),
       });
       if (!response.ok || !response.body) {
-        renderError(`请求失败（HTTP ${response.status}）`);
+        renderError(turn, `请求失败（HTTP ${response.status}）`);
         return;
       }
 
@@ -777,21 +912,20 @@
         buffer += decoder.decode(value, { stream: true });
         let cut;
         while ((cut = buffer.indexOf('\n\n')) >= 0) {
-          handleFrame(buffer.slice(0, cut));
+          handleFrame(buffer.slice(0, cut), turn);
           buffer = buffer.slice(cut + 2);
         }
       }
-      sealProse();
+      sealProse(turn);
     } catch (error) {
-      renderError(`连接中断：${error.message}`);
+      renderError(turn, `连接中断：${error.message}`);
     } finally {
-      setRunning(false);
-      state.turn = null;
-      el.input.focus();
+      sealProse(turn);
+      if (run === runSeq) setRunning(false);
     }
   }
 
-  function handleFrame(frame) {
+  function handleFrame(frame, turn) {
     let name = 'message';
     const dataLines = [];
     for (const line of frame.split('\n')) {
@@ -807,10 +941,20 @@
       return;
     }
 
-    if (name === 'text') appendText(data.delta || '');
-    else if (name === 'step') appendTool(data);
-    else if (name === 'done') renderMetrics(data.metrics);
-    else if (name === 'error') renderError(data.message || '出错了');
+    if (name === 'text') appendText(turn, data.delta || '');
+    else if (name === 'step') appendTool(turn, data);
+    else if (name === 'done') {
+      renderMetrics(turn, data.metrics);
+      // done 是「答案已经给完了」的信号。后面那几件事（抽记忆、压历史、
+      // 算上下文）是锦上添花，不该让用户对着一个锁住的输入框等它们。
+      if (data.session) state.sessionId = data.session.id;
+      setRunning(false);
+      refreshSessions();
+      loadContext();
+    } else if (name === 'memory') renderMemo(turn, data.facts || []);
+    else if (name === 'compressed') renderCompressed(turn, data);
+    else if (name === 'context') setContext(data);
+    else if (name === 'error') renderError(turn, data.message || '出错了');
   }
 
   async function cancel() {
@@ -821,17 +965,992 @@
     }
   }
 
-  async function reset() {
-    if (state.running) await cancel();
-    await fetch('/api/reset', { method: 'POST' });
-    el.turns.replaceChildren();
-    el.empty.hidden = false;
-    el.input.focus();
-  }
-
+  /** 输入框跟着内容长高，最多 200px（再多就该自己滚了）。 */
   function autosize() {
     el.input.style.height = 'auto';
     el.input.style.height = Math.min(el.input.scrollHeight, 200) + 'px';
+  }
+
+  /** 清空**当前会话**的对话历史。会话本身、以及长期记忆都留着。 */
+  async function reset() {
+    if (state.running) await cancel();
+    try {
+      const result = await postJSON('/api/reset', {});
+      renderTranscript(result.session);
+      await refreshSessions();
+      toast('这个会话的历史清空了，长期记忆还在。');
+    } catch (error) {
+      toast(`清空失败：${error.message}`, { warn: true });
+    }
+  }
+
+  // ==================================================================== 图标
+  //
+  // 设计要求点名了 Lucide / Phosphor 那一路（细线、圆角、stroke-width 1.5、
+  // 颜色跟随文字），这里没有引它们：整个前端是零依赖的，为几个图标挂一个 CDN
+  // 脚本，等于把「CDN 挂了界面照常能用」这条性质搭进去。所以路径数据直接写在
+  // 这里，形状照着那种风格画（stroke-width 和尺寸在 style.css 的 .ico 里统一给）。
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const ICONS = {
+    plus: 'M12 5v14M5 12h14',
+    close: 'M6 6l12 12M18 6L6 18',
+    check: 'M5 12.5l4.5 4.5L19 7',
+    info: 'M12 4.5a7.5 7.5 0 1 0 0 15 7.5 7.5 0 0 0 0-15zM12 11v5M12 8h.01',
+    alert: 'M12 4l8.5 15h-17L12 4zM12 10v4M12 16.5h.01',
+    trash: 'M4 7h16M9.5 7V4.5h5V7M6.5 7l1 12.5h9l1-12.5M10 10.5v6M14 10.5v6',
+    pencil: 'M4 20h4L19.5 8.5a2.1 2.1 0 0 0-3-3L5 17v3zM14.5 6.5l3 3',
+    top: 'M12 19V6M7 11l5-5 5 5M5 20h14',
+    book: 'M4 5.5A2.5 2.5 0 0 1 6.5 3H19v18H6.5A2.5 2.5 0 0 1 4 18.5v-13zM9 3v18',
+    message: 'M4 5h16v11H9.5L4 20V5z',
+    sliders:
+      'M4 8h8M16 8h4M4 16h4M12 16h8' +
+      'M12 8a2 2 0 1 0 4 0 2 2 0 1 0-4 0' +
+      'M8 16a2 2 0 1 0 4 0 2 2 0 1 0-4 0',
+    slash: 'M12 4.5a7.5 7.5 0 1 0 0 15 7.5 7.5 0 0 0 0-15zM6.7 6.7l10.6 10.6',
+    panel: 'M4 5h16v14H4zM9.5 5v14',
+    layers: 'M4 7h16M4 12h16M4 17h10',
+  };
+
+  function icon(name, cls) {
+    const box = document.createElement('span');
+    box.className = 'ico' + (cls ? ' ' + cls : '');
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS(SVG_NS, 'path');
+    path.setAttribute('d', ICONS[name] || ICONS.info);
+    svg.appendChild(path);
+    box.appendChild(svg);
+    return box;
+  }
+
+  /** 把 HTML 里的 `<span data-icon="x">` 占位换成真的图标。 */
+  function fillIcons(root) {
+    for (const holder of root.querySelectorAll('[data-icon]')) {
+      holder.replaceWith(icon(holder.dataset.icon));
+    }
+  }
+
+  /** 一个只有图标的按钮。侧栏条目和记忆条目上那些「悬停才出现」的操作都用它。 */
+  function iconButton(name, label, onClick, cls) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'icon-btn' + (cls ? ' ' + cls : '');
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    button.appendChild(icon(name));
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      onClick();
+    });
+    return button;
+  }
+
+  // ==================================================================== 接口
+
+  async function getJSON(path) {
+    const response = await fetch(path);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  }
+
+  /**
+   * POST 一个会改状态的接口。失败时把服务端那句话抛出来。
+   *
+   * 服务端把「用户填错了」翻成 400 并带一句人话（「标题不能为空」），这里要是
+   * 一律报「请求失败」，那句人话就白写了。500 不带人话，退回状态码就行 ——
+   * 那种情况本来也不该指望界面能解释清楚。
+   */
+  async function postJSON(path, body) {
+    const response = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      /* 没回 JSON（连接断了、被代理截了），下面按状态码处理 */
+    }
+    if (!response.ok) throw new Error((data && data.error) || `HTTP ${response.status}`);
+    return data || {};
+  }
+
+  // ==================================================================== 提示条
+  //
+  // 三种轻量反馈，各管一件事，不混用：
+  //   toast   —— 刚才那件事做成了（右下角，几秒后自己消失）
+  //   notice  —— 界面上发生了什么变化（顶部一条，说明「你现在看到的是哪个会话」）
+  //   dialog  —— 不可撤销、需要停一下的操作（清空全部、忘掉一条记忆）
+
+  function toast(text, options) {
+    const opts = options || {};
+    const box = document.createElement('div');
+    box.className = 'toast';
+    box.appendChild(icon(opts.warn ? 'alert' : 'check', opts.warn ? 'warn' : 'ok'));
+    const label = document.createElement('span');
+    label.textContent = text;
+    box.appendChild(label);
+
+    let gone = false;
+    const dismiss = () => {
+      if (gone) return;
+      gone = true;
+      clearTimeout(timer);
+      box.classList.add('leaving');
+      setTimeout(() => box.remove(), 200);
+    };
+
+    if (opts.action) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'link-btn';
+      button.textContent = opts.action.label;
+      button.addEventListener('click', () => {
+        dismiss();
+        opts.action.run();
+      });
+      box.appendChild(button);
+    }
+
+    el.toastHost.appendChild(box);
+    const timer = setTimeout(dismiss, opts.action ? 9000 : 3200);
+    return dismiss;
+  }
+
+  /** 顶部那条「已切换到……」。几秒后自己收回去，也可以手动关。 */
+  function noticeSession(title) {
+    el.noticeText.replaceChildren();
+    el.noticeText.appendChild(document.createTextNode('已切换到 '));
+    const name = document.createElement('b');
+    name.textContent = title;
+    el.noticeText.appendChild(name);
+    el.noticeText.appendChild(document.createTextNode('，下面是它的完整历史。'));
+    el.notice.hidden = false;
+    clearTimeout(state.noticeTimer);
+    state.noticeTimer = setTimeout(() => {
+      el.notice.hidden = true;
+    }, 4200);
+  }
+
+  /**
+   * 需要停下来想一想的操作走这里。确认 resolve(true)，取消 / Esc / 点背景
+   * resolve(false)。
+   *
+   * 给了 ``confirmWord`` 就要求一字不差地打出来才让点确认 —— 这是给「清空全部
+   * 会话」那种不可撤销的操作准备的。界面上挡一次手滑，服务端还会再挡一次
+   * （见 clear_all）：前端校验挡不住绕过界面直接发请求的人。
+   */
+  function confirmDialog(options) {
+    return new Promise((resolve) => {
+      const panel = el.dialogPanel;
+      panel.replaceChildren();
+
+      const title = document.createElement('h3');
+      title.textContent = options.title;
+      panel.appendChild(title);
+
+      if (options.body) {
+        const body = document.createElement('p');
+        body.textContent = options.body;
+        panel.appendChild(body);
+      }
+
+      let input = null;
+      if (options.confirmWord) {
+        input = document.createElement('input');
+        input.type = 'text';
+        input.autocomplete = 'off';
+        input.spellcheck = false;
+        input.placeholder = options.confirmWord;
+        panel.appendChild(input);
+        const note = document.createElement('p');
+        note.className = 'dialog-note';
+        note.textContent = `请输入「${options.confirmWord}」以确认`;
+        panel.appendChild(note);
+      }
+
+      const buttons = document.createElement('div');
+      buttons.className = 'dialog-btns';
+      const cancelBtn = document.createElement('button');
+      cancelBtn.type = 'button';
+      cancelBtn.textContent = '取消';
+      const goBtn = document.createElement('button');
+      goBtn.type = 'button';
+      goBtn.className = 'go';
+      goBtn.textContent = options.confirmText || '确定';
+      buttons.append(cancelBtn, goBtn);
+      panel.appendChild(buttons);
+
+      const close = (answer) => {
+        el.dialog.hidden = true;
+        document.removeEventListener('keydown', onKey);
+        el.dialog.removeEventListener('click', onBackdrop);
+        resolve(answer);
+      };
+      const onKey = (event) => {
+        if (event.key === 'Escape') close(false);
+        else if (event.key === 'Enter' && !goBtn.disabled) close(true);
+      };
+      const onBackdrop = (event) => {
+        if (event.target === el.dialog) close(false);
+      };
+      const sync = () => {
+        goBtn.disabled = !!options.confirmWord && input.value.trim() !== options.confirmWord;
+      };
+
+      if (input) {
+        input.addEventListener('input', sync);
+        sync();
+      }
+      cancelBtn.addEventListener('click', () => close(false));
+      goBtn.addEventListener('click', () => {
+        if (!goBtn.disabled) close(true);
+      });
+
+      el.dialog.hidden = false;
+      document.addEventListener('keydown', onKey);
+      el.dialog.addEventListener('click', onBackdrop);
+      // 焦点落在取消上，不是确认上：回车连打两下不该把东西删掉
+      (input || cancelBtn).focus();
+    });
+  }
+
+  // ==================================================================== 视图切换
+
+  function showView(name) {
+    state.view = name;
+    for (const tab of el.sideTabs) tab.classList.toggle('current', tab.dataset.view === name);
+    el.stream.hidden = name !== 'chat';
+    el.pageMemory.hidden = name !== 'memory';
+    el.pageSettings.hidden = name !== 'settings';
+    el.app.classList.remove('side-open');
+    el.scrim.hidden = true;
+
+    if (name === 'chat') {
+      // 回到对话页时重放一次上下文状态：设置项里那个「显示上下文状态」是在
+      // **另一个页面**上关掉的，不在这里补一次，就得等下一轮回答才生效——
+      // 而设置页自己写着「改完立刻生效」。
+      syncContext();
+      scrollToEnd(true);
+      el.input.focus();
+    } else if (name === 'memory') {
+      loadMemories();
+    } else {
+      loadSettings();
+    }
+  }
+
+  function pageHead(title, sub) {
+    const box = document.createElement('div');
+    box.className = 'page-head';
+    const head = document.createElement('h2');
+    head.textContent = title;
+    const text = document.createElement('p');
+    text.textContent = sub;
+    box.append(head, text);
+    return box;
+  }
+
+  // ==================================================================== 会话侧栏
+
+  async function refreshSessions() {
+    let listing;
+    try {
+      listing = await getJSON('/api/sessions');
+    } catch {
+      return; // 侧栏拉不到就维持现状：一块导航不该为网络问题弹错误
+    }
+    state.sessions = listing;
+    renderSessions(listing);
+  }
+
+  function renderSessions(listing) {
+    state.sessions = listing;
+    el.sideList.replaceChildren();
+    if (!listing.groups.length) {
+      const empty = document.createElement('div');
+      empty.className = 'side-empty';
+      empty.textContent = '还没有会话。';
+      el.sideList.appendChild(empty);
+      return;
+    }
+    for (const group of listing.groups) {
+      const head = document.createElement('div');
+      head.className = 'side-group';
+      head.textContent = group.label;
+      el.sideList.appendChild(head);
+      for (const item of group.items) el.sideList.appendChild(sessionRow(item));
+    }
+  }
+
+  function sessionRow(item) {
+    const wrap = document.createElement('div');
+    wrap.className =
+      'side-item' + (item.current ? ' current' : '') + (item.pinned ? ' pinned' : '');
+
+    const row = document.createElement('div');
+    row.className = 'side-row';
+
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'side-open';
+    const title = document.createElement('span');
+    title.className = 'side-title';
+    title.textContent = item.title;
+    title.title = item.title;
+    const meta = document.createElement('span');
+    meta.className = 'side-meta';
+    meta.textContent = item.turns ? `${item.turns} 轮 · ${item.age}` : item.age;
+    open.append(title, meta);
+    open.addEventListener('click', () => openSession(item.id));
+    if (item.current) open.setAttribute('aria-current', 'true');
+
+    const acts = document.createElement('div');
+    acts.className = 'side-acts';
+    acts.appendChild(
+      iconButton(
+        item.pinned ? 'top' : 'top',
+        item.pinned ? '取消置顶' : '置顶',
+        () => pinSession(item, !item.pinned),
+        item.pinned ? 'side-pin' : ''
+      )
+    );
+    acts.appendChild(iconButton('pencil', '重命名', () => startRename(wrap, item)));
+    acts.appendChild(iconButton('trash', '删除会话', () => startDelete(wrap, item)));
+
+    row.append(open, acts);
+    wrap.appendChild(row);
+    return wrap;
+  }
+
+  /** 点侧栏里的一条：把那个会话整段铺到主区。 */
+  async function openSession(sessionId) {
+    if (sessionId === state.sessionId) {
+      el.app.classList.remove('side-open');
+      return;
+    }
+    // 换会话前先把在跑的那一轮停掉：答案会落进旧会话，而界面已经翻页了
+    if (state.running) await cancel();
+
+    let detail;
+    try {
+      detail = await postJSON('/api/sessions/select', { id: sessionId });
+    } catch (error) {
+      toast(`切换会话失败：${error.message}`, { warn: true });
+      return;
+    }
+    state.sessionId = detail.id;
+    renderTranscript(detail);
+    await refreshSessions();
+    noticeSession(detail.title);
+    el.app.classList.remove('side-open');
+    el.scrim.hidden = true;
+    el.input.focus();
+  }
+
+  /** 把落盘的历史铺回消息流。切会话时**整段换掉**——留着上一场的回答是最糟的错觉。 */
+  function renderTranscript(detail) {
+    el.turns.replaceChildren();
+    const messages = detail.messages || [];
+    el.empty.hidden = messages.length > 0;
+
+    let bot = null;
+    for (const item of messages) {
+      if (item.role === 'user') {
+        const turn = document.createElement('article');
+        turn.className = 'turn';
+        const row = document.createElement('div');
+        row.className = 'msg-user';
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        bubble.textContent = item.text;
+        row.appendChild(bubble);
+        turn.appendChild(row);
+        bot = document.createElement('div');
+        bot.className = 'msg-bot';
+        turn.appendChild(bot);
+        el.turns.appendChild(turn);
+      } else if (!bot) {
+        continue; // 历史里第一组不是用户提问（旧数据），跳过而不是造一个没有提问的回答
+      } else if (item.role === 'assistant') {
+        const prose = document.createElement('div');
+        prose.className = 'prose';
+        prose.replaceChildren(renderRich(item.text));
+        bot.appendChild(prose);
+      } else if (item.role === 'tool') {
+        bot.appendChild(toolBox(item));
+      }
+    }
+
+    el.crumb.textContent = detail.title;
+    setContext(detail.context);
+    scrollToEnd(true);
+  }
+
+  async function newSession() {
+    if (state.running) await cancel();
+    let detail;
+    try {
+      detail = await postJSON('/api/sessions/new', {});
+    } catch (error) {
+      toast(`新建会话失败：${error.message}`, { warn: true });
+      return;
+    }
+    state.sessionId = detail.id;
+    renderTranscript(detail);
+    await refreshSessions();
+    showView('chat');
+    toast('已新建会话，这是一个干净的窗口。');
+    el.input.focus();
+  }
+
+  async function pinSession(item, pinned) {
+    try {
+      renderSessions(await postJSON('/api/sessions/pin', { id: item.id, pinned }));
+    } catch (error) {
+      toast(`置顶失败：${error.message}`, { warn: true });
+    }
+  }
+
+  function startRename(wrap, item) {
+    const row = wrap.querySelector('.side-row');
+    const input = document.createElement('input');
+    input.className = 'side-rename';
+    input.value = item.title;
+    input.maxLength = 60;
+    row.replaceWith(input);
+    input.focus();
+    input.select();
+
+    let done = false;
+    const finish = async (save) => {
+      if (done) return;
+      done = true;
+      const title = input.value.trim();
+      if (!save || !title || title === item.title) {
+        await refreshSessions();
+        return;
+      }
+      try {
+        renderSessions(await postJSON('/api/sessions/rename', { id: item.id, title }));
+        if (item.current) el.crumb.textContent = title;
+      } catch (error) {
+        toast(`重命名失败：${error.message}`, { warn: true });
+        await refreshSessions();
+      }
+    };
+
+    input.addEventListener('keydown', (event) => {
+      // stopPropagation：不然 Esc 会一路冒到 document 上，顺手把在跑的那一轮停掉
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        event.stopPropagation();
+        finish(true);
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        finish(false);
+      }
+    });
+    input.addEventListener('blur', () => finish(true));
+  }
+
+  function startDelete(wrap, item) {
+    const box = document.createElement('div');
+    box.className = 'side-confirm';
+
+    const ask = document.createElement('p');
+    ask.textContent = `删除「${item.title}」？这个会话的对话历史会一起删掉，删了找不回来。`;
+    box.appendChild(ask);
+
+    const buttons = document.createElement('div');
+    buttons.className = 'side-confirm-btns';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.textContent = '取消';
+    const go = document.createElement('button');
+    go.type = 'button';
+    go.className = 'go';
+    go.textContent = '删除';
+    buttons.append(cancel, go);
+    box.appendChild(buttons);
+    wrap.appendChild(box);
+    cancel.focus();
+
+    // 「同时删除这个会话产生的记忆」这个勾只在真有记忆时才出现：
+    // 一个永远勾不动、或者勾了也没东西可删的开关，比没有更让人困惑。
+    let removeMemories = false;
+    getJSON('/api/memories')
+      .then((memories) => {
+        const mine = memories.categories
+          .flatMap((group) => group.items)
+          .filter((fact) => fact.source_session === item.id);
+        if (!mine.length) return;
+        const label = document.createElement('label');
+        label.className = 'side-check';
+        const check = document.createElement('input');
+        check.type = 'checkbox';
+        check.checked = true;
+        removeMemories = true;
+        check.addEventListener('change', () => {
+          removeMemories = check.checked;
+        });
+        const text = document.createElement('span');
+        text.textContent = `同时删除这个会话产生的记忆（${mine.length} 条）`;
+        label.append(check, text);
+        box.insertBefore(label, buttons);
+      })
+      .catch(() => {});
+
+    cancel.addEventListener('click', () => {
+      box.remove();
+      wrap.querySelector('.side-open')?.focus();
+    });
+    go.addEventListener('click', async () => {
+      go.disabled = true;
+      try {
+        const wasCurrent = item.current;
+        const result = await postJSON('/api/sessions/delete', {
+          id: item.id,
+          with_memories: removeMemories,
+        });
+        renderSessions(result.sessions);
+        const dropped = result.memories_dropped || 0;
+        toast(
+          dropped
+            ? `会话已删除，连带忘掉了 ${dropped} 条记忆。`
+            : '会话已删除，长期记忆没动。'
+        );
+        if (wasCurrent && result.current) {
+          const detail = await postJSON('/api/sessions/select', { id: result.current });
+          state.sessionId = detail.id;
+          renderTranscript(detail);
+        }
+      } catch (error) {
+        toast(`删除失败：${error.message}`, { warn: true });
+        go.disabled = false;
+      }
+    });
+  }
+
+  async function clearAllSessions() {
+    const yes = await confirmDialog({
+      title: '清空全部会话？',
+      body: `所有对话历史都会删掉（共 ${state.sessions.count} 个会话），删了找不回来。长期记忆不受影响——那是「你是谁」，不是「你聊过什么」。`,
+      confirmWord: '确认删除',
+      confirmText: '清空',
+    });
+    if (!yes) return;
+
+    try {
+      const result = await postJSON('/api/sessions/clear', { confirm: '确认删除' });
+      renderSessions(result.sessions);
+      if (state.running) await cancel();
+      const detail = await getJSON('/api/session');
+      state.sessionId = detail.id;
+      renderTranscript(detail);
+      showView('chat');
+      toast(`已清空 ${result.cleared} 个会话，长期记忆都留着。`);
+    } catch (error) {
+      toast(`清空失败：${error.message}`, { warn: true });
+    }
+  }
+
+  // ==================================================================== 记忆页
+
+  async function loadMemories() {
+    let data;
+    try {
+      data = await getJSON('/api/memories');
+    } catch (error) {
+      toast(`记忆没读出来：${error.message}`, { warn: true });
+      return;
+    }
+    renderMemories(data);
+  }
+
+  function renderMemories(data) {
+    el.pageMemory.replaceChildren();
+    el.pageMemory.appendChild(
+      pageHead(
+        '记忆',
+        `长期记忆是唯一跨会话的东西：新建会话时会带上它们（除非关掉了继承）。` +
+          `目前 ${data.count} 条，其中 ${data.enabled} 条生效中。`
+      )
+    );
+
+    const add = document.createElement('div');
+    add.className = 'mem-add';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.maxLength = 200;
+    input.placeholder = '手动记一条，比如「我在用 Windows 开发」';
+    const select = document.createElement('select');
+    for (const group of data.categories) {
+      const option = document.createElement('option');
+      option.value = group.key;
+      option.textContent = group.label;
+      select.appendChild(option);
+    }
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = '记住';
+    const submit = async () => {
+      const content = input.value.trim();
+      if (!content) return;
+      button.disabled = true;
+      try {
+        // 写接口回的是 {fact, memories}：那一份 fact 给 toast 用得上，
+        // 但整页重画要的是 memories 本身。
+        renderMemories((await postJSON('/api/memories/add', { content, category: select.value })).memories);
+        toast('记住了。');
+      } catch (error) {
+        toast(`没记住：${error.message}`, { warn: true });
+        button.disabled = false;
+      }
+    };
+    button.addEventListener('click', submit);
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        submit();
+      }
+    });
+    add.append(input, select, button);
+    el.pageMemory.appendChild(add);
+
+    let any = false;
+    for (const group of data.categories) {
+      if (!group.items.length) continue;
+      any = true;
+      const section = document.createElement('section');
+      section.className = 'mem-cat';
+      const head = document.createElement('div');
+      head.className = 'mem-cat-head';
+      const label = document.createElement('span');
+      label.className = 'mem-cat-label';
+      label.textContent = group.label;
+      const count = document.createElement('span');
+      count.className = 'mem-cat-count';
+      count.textContent = String(group.items.length);
+      head.append(label, count);
+      section.appendChild(head);
+      for (const item of group.items) section.appendChild(memItem(item));
+      el.pageMemory.appendChild(section);
+    }
+
+    if (!any) {
+      const empty = document.createElement('p');
+      empty.className = 'mem-empty';
+      empty.textContent =
+        '还没有记住任何东西。聊到你的偏好、正在做的事时，我会自己记下来并给你看一眼。';
+      el.pageMemory.appendChild(empty);
+    }
+  }
+
+  function memItem(item) {
+    const row = document.createElement('div');
+    row.className = 'mem-item' + (item.disabled ? ' disabled' : '');
+
+    const body = document.createElement('div');
+    body.className = 'mem-body';
+    const content = document.createElement('div');
+    content.className = 'mem-content';
+    content.textContent = item.content;
+    body.appendChild(content);
+
+    // 停用不是删除：它还在列表里，只是不再注入。所以要有一个看得见的标记，
+    // 而不是整条消失——用户会以为被删了。
+    if (item.disabled) {
+      const off = document.createElement('span');
+      off.className = 'mem-off';
+      off.textContent = '已停用';
+      body.appendChild(off);
+    }
+
+    const acts = document.createElement('div');
+    acts.className = 'mem-acts';
+    acts.appendChild(iconButton('pencil', '编辑', () => startEdit(row, item)));
+    acts.appendChild(
+      iconButton(
+        item.disabled ? 'check' : 'slash',
+        item.disabled ? '恢复' : '停用',
+        () => patchFact(item, { disabled: !item.disabled })
+      )
+    );
+    acts.appendChild(iconButton('trash', '忘掉这条', () => forgetFact(item)));
+    body.appendChild(acts);
+    row.appendChild(body);
+
+    const meta = document.createElement('div');
+    meta.className = 'mem-meta';
+    const origin = document.createElement('span');
+    origin.textContent = `来自：${item.origin}`;
+    const age = document.createElement('span');
+    age.textContent = `更新于 ${item.age}`;
+    const version = document.createElement('span');
+    version.textContent = `第 ${item.version} 版`;
+    meta.append(origin, age, version);
+    row.appendChild(meta);
+    return row;
+  }
+
+  async function patchFact(item, changes) {
+    try {
+      renderMemories((await postJSON('/api/memories/update', { id: item.id, ...changes })).memories);
+      if (changes.disabled === true) toast('已停用，下一轮开始不再带上它。');
+      else if (changes.disabled === false) toast('已恢复。');
+    } catch (error) {
+      toast(`没改成：${error.message}`, { warn: true });
+    }
+  }
+
+  function startEdit(row, item) {
+    const panel = document.createElement('div');
+    panel.className = 'mem-edit';
+    const textarea = document.createElement('textarea');
+    textarea.value = item.content;
+    textarea.maxLength = 200;
+    panel.appendChild(textarea);
+
+    const controls = document.createElement('div');
+    controls.className = 'mem-edit-row';
+    const select = document.createElement('select');
+    for (const [key, label] of [
+      ['identity', '身份'],
+      ['preference', '偏好'],
+      ['project', '项目'],
+      ['other', '其他'],
+    ]) {
+      const option = document.createElement('option');
+      option.value = key;
+      option.textContent = label;
+      if (key === item.category) option.selected = true;
+      select.appendChild(option);
+    }
+    const spacer = document.createElement('span');
+    spacer.className = 'spacer';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.textContent = '取消';
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'save';
+    save.textContent = '保存';
+    controls.append(select, spacer, cancel, save);
+    panel.appendChild(controls);
+    row.appendChild(panel);
+    textarea.focus();
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+
+    cancel.addEventListener('click', () => panel.remove());
+    textarea.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        panel.remove();
+      } else if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault();
+        save.click();
+      }
+    });
+    save.addEventListener('click', async () => {
+      const content = textarea.value.trim();
+      if (!content) {
+        toast('内容不能是空的。', { warn: true });
+        return;
+      }
+      await patchFact(item, { content, category: select.value });
+      toast('改好了，下一轮开始用新的。');
+    });
+  }
+
+  async function forgetFact(item) {
+    const yes = await confirmDialog({
+      title: '忘掉这条记忆？',
+      body: `「${item.content}」`,
+      confirmText: '忘掉',
+    });
+    if (!yes) return;
+    try {
+      renderMemories((await postJSON('/api/memories/delete', { id: item.id })).memories);
+      toast('已经忘掉了。');
+    } catch (error) {
+      toast(`没删掉：${error.message}`, { warn: true });
+    }
+  }
+
+  // ==================================================================== 设置页
+
+  async function loadSettings() {
+    let data;
+    try {
+      data = await getJSON('/api/settings');
+    } catch (error) {
+      toast(`设置没读出来：${error.message}`, { warn: true });
+      return;
+    }
+    renderSettings(data);
+  }
+
+  function renderSettings(data) {
+    // 顺手把开机时抓的那份 /api/info.settings 刷新掉。setContext 是拿它判断
+    // 「显示上下文状态」开没开的——那份是启动时抓的，改完设置不同步，
+    // 开关就得等下一次回答才生效。
+    state.info.settings = Object.fromEntries(data.items.map((item) => [item.key, item.value]));
+
+    el.pageSettings.replaceChildren();
+    el.pageSettings.appendChild(
+      pageHead('设置', '这些开关存在本地数据库里，重启之后还在。改完立刻生效，不用重启。')
+    );
+
+    for (const item of data.items) {
+      const row = document.createElement('div');
+      row.className = 'set-item';
+      const text = document.createElement('div');
+      text.className = 'set-text';
+      const label = document.createElement('div');
+      label.className = 'set-label';
+      label.textContent = item.label;
+      const hint = document.createElement('div');
+      hint.className = 'set-hint';
+      hint.textContent = item.hint;
+      text.append(label, hint);
+
+      const toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'switch';
+      toggle.setAttribute('role', 'switch');
+      toggle.setAttribute('aria-checked', String(item.value));
+      toggle.setAttribute('aria-label', item.label);
+      toggle.addEventListener('click', async () => {
+        const next = toggle.getAttribute('aria-checked') !== 'true';
+        toggle.setAttribute('aria-checked', String(next)); // 先动，失败再翻回来
+        try {
+          const fresh = await postJSON('/api/settings', { values: { [item.key]: next } });
+          renderSettings(fresh); // 顺带刷新 state.info.settings
+          syncContext(); // 立刻按新设置重画上下文状态行
+        } catch (error) {
+          toggle.setAttribute('aria-checked', String(!next));
+          toast(`没改成功：${error.message}`, { warn: true });
+        }
+      });
+
+      row.append(text, toggle);
+      el.pageSettings.appendChild(row);
+    }
+
+    const note = document.createElement('p');
+    note.className = 'page-note';
+    note.textContent =
+      '长期记忆和会话历史都存在本机的 SQLite 里，不上传任何地方。' +
+      '关掉「自动保存会话」只影响新写入的历史，已经存下的不会因此被删。';
+    el.pageSettings.appendChild(note);
+  }
+
+  // ==================================================================== 上下文状态
+
+  /** 拉一次当前会话的上下文状态。切会话、跑完一轮、改设置之后都该刷。 */
+  async function loadContext() {
+    try {
+      setContext(await getJSON('/api/context'));
+    } catch {
+      /* 状态行是装饰，拉不到就不显示 */
+    }
+  }
+
+  function syncContext() {
+    setContext(state.context);
+  }
+
+  /**
+   * 输入框上方那行「上下文约 N tokens」，以及展开后的分层明细。
+   *
+   * 比例条用的是**字符**预算（window_chars / budget_chars），不是 token：
+   * 真正决定历史被裁到哪里的就是那个字符上限，拿 tokens 去除以字符预算会得到
+   * 一个凭空造出来的百分比。token 数只出现在文字和明细里，那里本来就是估算值。
+   */
+  function setContext(data) {
+    state.context = data;
+    const show = data && state.info.settings && state.info.settings.show_context;
+    if (!show) {
+      el.ctx.hidden = true;
+      return;
+    }
+    el.ctx.hidden = false;
+
+    const tokens = data.degraded ? null : data.tokens;
+    el.ctxText.replaceChildren();
+    el.ctxText.appendChild(document.createTextNode('上下文 '));
+    const strong = document.createElement('b');
+    strong.textContent = tokens === null ? `${data.messages} 条历史` : money(tokens);
+    el.ctxText.appendChild(strong);
+    el.ctxText.appendChild(document.createTextNode(tokens === null ? '' : ' tokens'));
+
+    const total = data.budget_chars || 0;
+    const used = data.window_chars || 0;
+    const ratio = total > 0 ? Math.min(used / total, 1) : 0;
+    el.ctxBar.replaceChildren();
+    const fill = document.createElement('span');
+    fill.style.width = (ratio * 100).toFixed(1) + '%';
+    el.ctxBar.appendChild(fill);
+    el.ctxBar.classList.toggle('warn', ratio > 0.8);
+    el.ctxLine.title = total
+      ? `窗口 ${money(used)} / ${money(total)} 字符，指上去看各层明细`
+      : '指上去看各层明细';
+
+    el.ctxDetail.replaceChildren();
+    if (data.degraded) {
+      const row = document.createElement('div');
+      row.className = 'ctx-foot';
+      row.textContent =
+        '这个会话还没在本进程里跑过，分层统计要等下一次提问才算得出来；上面那条消息数是留在库里的历史。';
+      el.ctxDetail.appendChild(row);
+      return;
+    }
+
+    const max = Math.max(1, ...data.layers.map((layer) => layer.tokens));
+    for (const layer of data.layers) {
+      const row = document.createElement('div');
+      row.className = 'ctx-row';
+      row.dataset.layer = layer.key;
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = layer.label;
+      const track = document.createElement('span');
+      track.className = 'track';
+      const fillBar = document.createElement('span');
+      fillBar.className = 'fill';
+      fillBar.style.width = ((layer.tokens / max) * 100).toFixed(1) + '%';
+      track.appendChild(fillBar);
+      const num = document.createElement('span');
+      num.className = 'num';
+      num.textContent = money(layer.tokens);
+      row.append(name, track, num);
+      el.ctxDetail.appendChild(row);
+    }
+
+    const foot = document.createElement('div');
+    foot.className = 'ctx-foot';
+    const lines = [
+      `窗口 ${money(used)} / ${money(total)} 字符 · 保留 ${data.window_messages} 条消息 · 已丢弃 ${data.dropped_messages} 条`,
+    ];
+    if (data.summary) {
+      lines.push(`历史摘要已覆盖到第 ${data.summary_upto} 条（不再进窗口）`);
+    }
+    if (data.pending_tokens) {
+      lines.push(`还有约 ${money(data.pending_tokens)} tokens 的旧历史没压进摘要，下次回答完会滚一次`);
+    }
+    if (!data.auto_summarize) {
+      lines.push('「自动压缩历史」关着：超出窗口的对话会直接丢弃，不压成摘要');
+    }
+    if (!data.memory_enabled) {
+      lines.push('「长期记忆」关着：上面那层长期记忆没有注入');
+    }
+    foot.textContent = lines.join('；');
+    el.ctxDetail.appendChild(foot);
   }
 
   // ==================================================================== 启动
@@ -901,17 +2020,41 @@
   }
 
   async function boot() {
+    fillIcons(document); // 先把静态 HTML 里那些 [data-icon] 占位换成图标
     try {
       state.info = await (await fetch('/api/info')).json();
     } catch {
-      state.modelText.textContent = '未连接';
+      el.modelText.textContent = '未连接';
       return;
     }
+    state.info.settings = state.info.settings || {};
+    state.sessionId = (state.info.session || {}).id || '';
+    el.crumb.textContent = (state.info.session || {}).title || '新对话';
     el.modelText.textContent = `${state.info.provider} · ${state.info.model}`;
     el.chip.title = `${state.info.provider} / ${state.info.model} · 最多 ${state.info.max_steps} 步`;
     renderSuggestions();
     renderTools();
+    refreshSessions();
+    restoreSession();
     renderHot(); // 不 await：主页先出来，热点随后把静态建议换掉
+  }
+
+  /**
+   * 把上次那个会话的历史铺出来。
+   *
+   * 这是「会话落盘」在界面上兑现的地方：刷新页面、重启程序之后，看到的还是
+   * 上次的对话，而不是一张白纸。走 GET /api/session 而不是 POST select ——
+   * 服务端本来就停在最近活动的那个会话上，读一次就行。
+   */
+  async function restoreSession() {
+    let detail;
+    try {
+      detail = await getJSON('/api/session');
+    } catch {
+      return;
+    }
+    state.sessionId = detail.id;
+    renderTranscript(detail);
   }
 
   // ---- 事件绑定 ----
@@ -928,9 +2071,9 @@
     }
   });
 
-  // 生成过程中按 Esc 也能停
+  // 生成过程中按 Esc 也能停。弹着对话框时不抢——那时候 Esc 是「关掉对话框」
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && state.running) cancel();
+    if (event.key === 'Escape' && state.running && el.dialog.hidden) cancel();
   });
 
   $('reset-btn').addEventListener('click', reset);
@@ -942,6 +2085,45 @@
   });
   el.sheet.addEventListener('click', (event) => {
     if (event.target === el.sheet) el.sheet.hidden = true;
+  });
+
+  $('new-chat').addEventListener('click', newSession);
+  $('clear-all').addEventListener('click', clearAllSessions);
+  $('notice-close').addEventListener('click', () => {
+    el.notice.hidden = true;
+  });
+
+  for (const tab of el.sideTabs) {
+    tab.addEventListener('click', () => showView(tab.dataset.view));
+  }
+
+  // 窄屏的抽屉。scrim 是抽屉外面那层暗底，点它关掉
+  $('side-show').addEventListener('click', () => {
+    el.app.classList.add('side-open');
+    el.scrim.hidden = false;
+  });
+  $('side-hide').addEventListener('click', () => {
+    el.app.classList.remove('side-open');
+    el.scrim.hidden = true;
+  });
+  el.scrim.addEventListener('click', () => {
+    el.app.classList.remove('side-open');
+    el.scrim.hidden = true;
+  });
+
+  // 上下文状态：指上去展开，点一下钉住（钉住之后移开鼠标不收回，方便细看）
+  let ctxPinned = false;
+  const showCtxDetail = (show) => {
+    el.ctxDetail.hidden = !show;
+    el.ctxLine.setAttribute('aria-expanded', String(show));
+  };
+  el.ctx.addEventListener('mouseenter', () => showCtxDetail(true));
+  el.ctx.addEventListener('mouseleave', () => {
+    if (!ctxPinned) showCtxDetail(false);
+  });
+  el.ctxLine.addEventListener('click', () => {
+    ctxPinned = !ctxPinned;
+    showCtxDetail(ctxPinned);
   });
 
   el.stream.addEventListener('scroll', () => {

@@ -37,43 +37,111 @@
 </head>
 <body>
 
-<div class="app">
+<div class="app" id="app">
 
-  <header class="topbar">
-    <div class="brand">
-      <span class="mark"></span>
-      <span class="name">Mini-Agent</span>
-    </div>
-    <div class="topbar-right">
-      <span class="chip" id="model-chip" title="当前模型后端">
-        <span class="pulse"></span><span id="model-text">连接中…</span>
+  <!--
+    侧栏：会话列表 + 视图入口。图标一律是内联 SVG（见 app.js 的 ICONS），
+    没有图标字体、没有 CDN——`[data-icon]` 是占位，启动时由 JS 填上。
+  -->
+  <aside class="sidebar" id="sidebar">
+    <div class="side-head">
+      <span class="brand">
+        <span class="mark"></span>
+        <span class="name">Mini-Agent</span>
       </span>
-      <button class="ghost" id="tools-btn" type="button" title="当前可用的工具">工具</button>
-      <button class="ghost" id="reset-btn" type="button" title="清空对话历史">清空</button>
-    </div>
-  </header>
-
-  <main class="stream" id="stream">
-    <section class="empty" id="empty">
-      <h1>今天想做点什么？</h1>
-      <p class="sub">我可以用工具去算、去查、去读写工作目录里的文件，而不是凭记忆猜。</p>
-      <div class="suggestions" id="suggestions"></div>
-    </section>
-    <div class="turns" id="turns"></div>
-  </main>
-
-  <footer class="composer">
-    <div class="box" id="box">
-      <textarea id="input" rows="1" placeholder="问点什么…" autocomplete="off" spellcheck="false"></textarea>
-      <button class="send" id="send" type="button" aria-label="发送">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h13M12 5.5 18.5 12 12 18.5"/></svg>
-      </button>
-      <button class="stop" id="stop" type="button" aria-label="停止" hidden>
-        <span class="sq"></span>
+      <button class="icon-btn" id="side-hide" type="button" title="收起侧栏" aria-label="收起侧栏">
+        <span class="ico" data-icon="panel"></span>
       </button>
     </div>
-    <div class="hint" id="hint"><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</div>
-  </footer>
+
+    <button class="new-chat" id="new-chat" type="button">
+      <span class="ico" data-icon="plus"></span>
+      <span class="new-chat-text">新建会话</span>
+    </button>
+
+    <nav class="side-list" id="side-list" aria-label="会话列表"></nav>
+
+    <div class="side-foot">
+      <button class="link-btn" id="clear-all" type="button">清空全部会话</button>
+      <div class="side-tabs" role="tablist">
+        <button class="side-tab" type="button" data-view="chat" role="tab">
+          <span class="ico" data-icon="message"></span><span>对话</span>
+        </button>
+        <button class="side-tab" type="button" data-view="memory" role="tab">
+          <span class="ico" data-icon="book"></span><span>记忆</span>
+        </button>
+        <button class="side-tab" type="button" data-view="settings" role="tab">
+          <span class="ico" data-icon="sliders"></span><span>设置</span>
+        </button>
+      </div>
+    </div>
+  </aside>
+
+  <div class="scrim" id="scrim" hidden></div>
+
+  <section class="main">
+
+    <header class="topbar">
+      <button class="icon-btn" id="side-show" type="button" title="展开侧栏" aria-label="展开侧栏">
+        <span class="ico" data-icon="panel"></span>
+      </button>
+      <div class="crumb" id="crumb">新对话</div>
+      <div class="topbar-right">
+        <span class="chip" id="model-chip" title="当前模型后端">
+          <span class="pulse"></span><span id="model-text">连接中…</span>
+        </span>
+        <button class="ghost" id="tools-btn" type="button" title="当前可用的工具">工具</button>
+        <button class="ghost" id="reset-btn" type="button" title="清空当前会话的历史（长期记忆不动）">清空</button>
+      </div>
+    </header>
+
+    <!-- 切换会话时从顶上滑下来的一条提示，几秒后自己收回去 -->
+    <div class="notice" id="notice" hidden>
+      <span class="notice-dot"></span>
+      <span class="notice-text" id="notice-text"></span>
+      <button class="icon-btn" id="notice-close" type="button" aria-label="关闭提示">
+        <span class="ico" data-icon="close"></span>
+      </button>
+    </div>
+
+    <div class="views">
+
+      <main class="stream" id="stream">
+        <section class="empty" id="empty">
+          <h1>今天想做点什么？</h1>
+          <p class="sub">我可以用工具去算、去查、去读写工作目录里的文件，而不是凭记忆猜。</p>
+          <div class="suggestions" id="suggestions"></div>
+        </section>
+        <div class="turns" id="turns"></div>
+      </main>
+
+      <section class="page" id="page-memory" hidden aria-label="记忆管理"></section>
+      <section class="page" id="page-settings" hidden aria-label="设置"></section>
+
+    </div>
+
+    <footer class="composer" id="composer">
+      <!-- 上下文状态：一行摘要，悬停（或点一下）展开各层的单色条形 -->
+      <div class="ctx" id="ctx" hidden>
+        <button class="ctx-line" id="ctx-line" type="button" aria-expanded="false" aria-controls="ctx-detail">
+          <span class="ctx-text" id="ctx-text"></span>
+          <span class="ctx-bar" id="ctx-bar"></span>
+        </button>
+        <div class="ctx-detail" id="ctx-detail" hidden></div>
+      </div>
+      <div class="box" id="box">
+        <textarea id="input" rows="1" placeholder="问点什么…" autocomplete="off" spellcheck="false"></textarea>
+        <button class="send" id="send" type="button" aria-label="发送">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h13M12 5.5 18.5 12 12 18.5"/></svg>
+        </button>
+        <button class="stop" id="stop" type="button" aria-label="停止" hidden>
+          <span class="sq"></span>
+        </button>
+      </div>
+      <div class="hint" id="hint"><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</div>
+    </footer>
+
+  </section>
 
 </div>
 
@@ -85,6 +153,14 @@
     </div>
     <ul class="tool-list" id="tool-list"></ul>
   </div>
+</div>
+
+<!-- 一次性的提示（新建了会话、撤销了一条记忆……）。不是弹窗，不挡操作。 -->
+<div class="toast-host" id="toast-host" aria-live="polite"></div>
+
+<!-- 需要停下来想一想的操作（清空全部、删除记忆）走这里，面板内容由 JS 填 -->
+<div class="dialog" id="dialog" hidden>
+  <div class="dialog-panel" id="dialog-panel" role="dialog" aria-modal="true"></div>
 </div>
 
 <script src="/static/app.js"></script>

@@ -1,8 +1,12 @@
-"""Web 入口层：把同一个 Agent 挂到浏览器上（设计方案 §三.5、§九 第四阶段）。
+"""Web 入口层：把 Agent 挂到浏览器上（设计方案 §三.5、§九 第四阶段）。
 
 和最上面那层的关系：**它和 main.py 是平级的两个入口**，谁也不含业务逻辑。
 - 装配那一份共用 ``main.build_agent()``，四层里的任何一层都没为网页改过一行；
 - 参数解析共用 ``main.cli_overrides()``，「命令行能换模型、网页换不了」这种漂移不会发生。
+
+**这一层只做三件事**：路由、同源校验、把会话层吐出来的事件写成 SSE。
+「一个会话是什么」「记忆怎么抽」这类问题都在 :mod:`web.sessions` 里回答，
+这里连一次 ``store`` 都不直接调。
 
 刻意只用标准库（``http.server`` + SSE）：
 本地单机界面为了少写几十行而引一个 Web 框架，换来的是又多一份依赖要维护。
@@ -24,14 +28,9 @@ import argparse
 import json
 import logging
 import mimetypes
-import queue
 import socket
 import sys
-import threading
-import time
 import webbrowser
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -41,10 +40,18 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:  # 支持 `python web/server.py` 直接跑，不要求先 pip install -e .
     sys.path.insert(0, str(ROOT))
 
-from agent import Agent, AgentResult, StepRecord, __version__  # noqa: E402
+from agent import __version__  # noqa: E402
+from agent.store import Store  # noqa: E402
 from config import Config, setup_logging  # noqa: E402
-from main import build_agent, cli_overrides  # noqa: E402
+from main import cli_overrides  # noqa: E402
 from web import hot  # noqa: E402
+from web.sessions import Session, SessionError, SessionManager  # noqa: E402
+from web.telemetry import (  # noqa: E402,F401  ← 这几个名字从这里重新导出给调用方用
+    STOP_REASONS,
+    TurnClock,
+    metrics_payload,
+    step_payload,
+)
 
 logger = logging.getLogger("web")
 
@@ -101,275 +108,6 @@ SUGGESTIONS: tuple[tuple[str, str], ...] = (
 #: 「高级简洁」的第一条就是别一上来糊一屏字。
 _MAX_SUGGESTIONS = 5
 
-#: stop_reason → 给界面看的中文说法
-STOP_REASONS = {
-    "final": "完成",
-    "refusal": "模型拒绝回答",
-    "max_steps": "达到步数上限",
-    "cancelled": "已中断",
-    "error": "出错",
-}
-
-
-# --------------------------------------------------------------------------- #
-# 一轮对话：计时与事件出口
-# --------------------------------------------------------------------------- #
-
-
-@dataclass
-class TurnClock:
-    """给一轮对话计时。
-
-    要算「token 速度」就必须把**生成窗口**和**整轮耗时**分开：
-    整轮里混着工具执行、网络往返、排队，拿它当分母会把速度算得莫名其妙地低。
-    生成窗口 = 第一个字到最后一个字之间的那段，这才是模型真正在解码的时间。
-    """
-
-    started: float
-    first_chunk: float | None = None
-    last_chunk: float | None = None
-    chars: int = 0
-
-    def mark(self, chunk: str) -> None:
-        now = time.perf_counter()
-        if self.first_chunk is None:
-            self.first_chunk = now
-        self.last_chunk = now
-        self.chars += len(chunk)
-
-    @property
-    def elapsed(self) -> float:
-        return time.perf_counter() - self.started
-
-    @property
-    def ttft(self) -> float:
-        """首字延迟：从提问到看见第一个字。流式体验里最敏感的一个数。"""
-        if self.first_chunk is None:
-            return 0.0
-        return self.first_chunk - self.started
-
-    def generation_window(self) -> float:
-        """生成窗口（秒）。没走流式时退化成整轮耗时，否则速度无从谈起。
-
-        判断「有没有收到过分片」必须拿 ``is None`` 比，不能图省事写 ``if self.first_chunk``
-        ——时间戳是个 float，0.0 是合法值，（测试里就撞上了）会被当成「没收到」。
-        """
-        if self.first_chunk is not None and self.last_chunk is not None:
-            window = self.last_chunk - self.first_chunk
-            if window > 0.05:
-                return window
-        return max(self.elapsed, 1e-6)
-
-
-def step_payload(record: StepRecord) -> dict[str, Any]:
-    """把 StepRecord 翻成前端要的形状（可观测性，§三.4）。"""
-    return {
-        "index": record.index,
-        "kind": record.kind,
-        "tool": record.tool_name,
-        "arguments": record.arguments,
-        "result": record.result,
-        "is_error": record.is_error,
-        "elapsed": round(record.elapsed, 3),
-        "text": record.text,
-    }
-
-
-#: 解码窗口短于这个秒数就不报「解码速率」。见 metrics_payload 的说明。
-_MIN_TRUSTED_WINDOW = 0.5
-
-
-def metrics_payload(result: AgentResult, clock: TurnClock) -> dict[str, Any]:
-    """界面上要显示的那几个数（用户明确要求的：输入/输出 token、token 速度…）。
-
-    **token 速度用「总输出 token ÷ 模型总耗时」，不用解码窗口。** 这是踩过两次坑
-    之后才定下来的，理由值得写清楚：
-
-    1. 第一版拿入口层「第一个字到最后一个字」当分母。一轮带工具调用的对话跑出
-       460 tok/s —— 分子（``output_tokens``）是**所有**模型调用的总和，分母却只覆盖
-       最后那次调用里**看得见的那点文字**，发工具调用那一轮的 token 花了时间没进分母。
-    2. 第二版改用模型层测的「解码窗口」（第一个增量到最后一个增量）。数字好看了，
-       但立刻发现**厂商并不总是逐字吐**：实测 DeepSeek 一次工具调用把几十个 token
-       攒在一个 45ms 的批次里发出来，于是分母 0.045s、速度 600+ tok/s —— 纯属噪声。
-       文本回答倒是逐字来的，所以这个坑只在短输出上出现，最难发现。
-
-    结论：分母用 ``llm_seconds``（模型调用从发出到收完的**总**时间，含首字等待）。
-    它把排队和 prefill 也算进去了，所以比瞬时解码速度低一些，但它**稳定、可复现、
-    不会因为厂商怎么切分片而变**——显示给用户的数，可信比好看重要。
-
-    ``decode_tok_per_s`` 仍然照实给出来（窗口够长时它才准，够短时置 0 表示不可信），
-    放在提示气泡里，想深究的人能看到。
-    """
-    usage = result.usage or {}
-    timing = result.timing or {}
-    output_tokens = int(usage.get("output_tokens", 0) or 0)
-
-    llm_seconds = float(timing.get("llm_seconds") or 0.0)
-    window_source = "模型层"
-    if llm_seconds <= 0.05:
-        # 适配器没测（非流式），退回入口层自己量的那一段
-        llm_seconds = clock.generation_window()
-        window_source = "入口层"
-
-    decode_seconds = float(timing.get("decode_seconds") or 0.0)
-    decode_speed = 0.0
-    if output_tokens and decode_seconds >= _MIN_TRUSTED_WINDOW:
-        decode_speed = round(output_tokens / decode_seconds, 1)
-
-    return {
-        "input_tokens": int(usage.get("input_tokens", 0) or 0),
-        "output_tokens": output_tokens,
-        "cache_read_input_tokens": int(usage.get("cache_read_input_tokens", 0) or 0),
-        "tok_per_s": round(output_tokens / llm_seconds, 1) if output_tokens else 0.0,
-        "chars": clock.chars,
-        "chars_per_s": round(clock.chars / llm_seconds, 1) if clock.chars else 0.0,
-        "elapsed": round(clock.elapsed, 2),
-        "ttft": round(clock.ttft, 2),
-        "llm_seconds": round(llm_seconds, 2),
-        "decode_seconds": round(decode_seconds, 2),
-        "decode_tok_per_s": decode_speed,
-        "window_source": window_source,
-        "steps": result.steps,
-        "tool_calls": sum(1 for record in result.trace if record.kind == "tool"),
-        "stop_reason": result.stop_reason,
-        "stop_reason_text": STOP_REASONS.get(result.stop_reason, result.stop_reason),
-    }
-
-
-# --------------------------------------------------------------------------- #
-# 会话：一个 Agent + 串行化
-# --------------------------------------------------------------------------- #
-
-
-class ChatSession:
-    """网页这一侧的会话。
-
-    Agent 是有状态的（记忆就在它里面），所以同一时刻只能有一轮在跑：
-    多开几个标签页也只是排队，不会把两轮对话搅进同一份记忆里。
-    """
-
-    def __init__(self, config: Config) -> None:
-        self.config = config
-        self._lock = threading.Lock()
-        self._agent: Agent | None = None
-        self._running: Agent | None = None
-        # 下面两个是「当前这一轮」的上下文，由 chat() 装上、跑完摘掉。
-        # 核心层的回调是装配时绑死的，所以换轮次只能换它们指向的东西，不能换回调本身。
-        self._emit: Callable[[str, dict[str, Any]], None] | None = None
-        self._clock: TurnClock | None = None
-        self.turns = 0
-
-    # ---------- 装配 ----------
-
-    @property
-    def agent(self) -> Agent:
-        """懒装配：第一次提问才真的去连模型层，启动因此不受网络影响。"""
-        if self._agent is None:
-            self._agent = build_agent(self.config, on_text=self._on_text, on_step=self._on_step)
-        return self._agent
-
-    def _on_text(self, chunk: str) -> None:
-        if self._clock is not None:
-            self._clock.mark(chunk)
-        if self._emit is not None:
-            self._emit("text", {"delta": chunk})
-
-    def _on_step(self, record: StepRecord) -> None:
-        # 只推「工具真的被调用」的那一步。final / max_steps 带的是最终答案，它已经走
-        # text / done 两条路过去了；再当步骤推一遍，界面上就会多出一个没有名字的工具块。
-        if record.kind != "tool" or self._emit is None:
-            return
-        self._emit("step", step_payload(record))
-
-    # ---------- 控制 ----------
-
-    def cancel(self) -> bool:
-        """请求中断正在跑的那一轮。线程安全，随时可调（Agent.cancel 是 Event）。"""
-        running = self._running
-        if running is None:
-            return False
-        logger.info("收到中断请求")
-        running.cancel()
-        return True
-
-    def reset(self) -> None:
-        if self._agent is not None:
-            self._agent.reset()
-
-    def info(self) -> dict[str, Any]:
-        tools = self.agent.tools.names()
-        return {
-            "version": __version__,
-            "provider": self.config.provider,
-            "model": self.config.model,
-            "tools": tools,
-            "max_steps": self.config.max_steps,
-            "stream": self.config.stream,
-            "workspace": self.config.workspace_dir,
-            "turns": self.turns,
-            "suggestions": [q for q, tool in SUGGESTIONS if tool in tools][:_MAX_SUGGESTIONS],
-        }
-
-    # ---------- 跑一轮 ----------
-
-    def chat(self, message: str) -> Iterator[tuple[str, dict[str, Any]]]:
-        """跑一轮对话，把过程中的事件一个个吐出来（SSE 的 event/data 对）。
-
-        生成器是在 HTTP 处理线程里被消费的，Agent 跑在另一个线程：
-        这样「一边生成一边推」和「随时能喊停」两件事才可能同时成立——
-        要是让处理线程自己去跑 Agent，它在 run() 里出不来，就没人去读中断请求了。
-        """
-        with self._lock:  # 一轮到底，中途不会被第二个标签页插进来
-            agent = self.agent
-            events: queue.Queue[tuple[str, dict[str, Any]] | None] = queue.Queue()
-            clock = TurnClock(started=time.perf_counter())
-
-            self._emit = lambda name, payload: events.put((name, payload))
-            self._clock = clock
-            self._running = agent
-
-            box: dict[str, Any] = {}
-
-            def work() -> None:
-                try:
-                    box["result"] = agent.run(message)
-                except Exception as exc:  # 兜底：绝不让异常把一个 HTTP 响应悬在半空
-                    logger.exception("这一轮跑挂了")
-                    box["error"] = exc
-                finally:
-                    events.put(None)
-
-            threading.Thread(target=work, daemon=True, name="mini-agent-turn").start()
-
-            try:
-                while True:
-                    item = events.get()
-                    if item is None:
-                        break
-                    yield item
-
-                if "error" in box:
-                    yield "error", {"message": f"{type(box['error']).__name__}: {box['error']}"}
-                else:
-                    result: AgentResult = box["result"]
-                    self.turns += 1
-                    yield (
-                        "done",
-                        {
-                            "answer": result.answer,
-                            "metrics": metrics_payload(result, clock),
-                        },
-                    )
-            finally:
-                self._emit = None
-                self._clock = None
-                self._running = None
-                if "result" not in box and "error" not in box:
-                    # 消费者提前跑掉了（关了标签页 / 断了连接）：这一轮没人要了，
-                    # 让它在下一个检查点自己收尾，别继续烧 token。
-                    logger.info("客户端断开，中止这一轮")
-                    agent.cancel()
-
 
 # --------------------------------------------------------------------------- #
 # HTTP
@@ -380,9 +118,18 @@ class WebServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], session: ChatSession) -> None:
+    def __init__(self, address: tuple[str, int], manager: SessionManager) -> None:
         super().__init__(address, Handler)
-        self.session = session
+        self.manager = manager
+
+    @property
+    def session(self) -> Session:
+        """当前会话。写成属性而不是启动时抓一份：
+
+        「当前会话」是会变的（新建 / 切换 / 删掉当前那个），启动时存下来的那份
+        在用户点一下侧栏之后就成了幽灵——接口还往旧会话里写。
+        """
+        return self.manager.current()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -392,12 +139,16 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"  # SSE 靠「写完后关连接」收尾，正好是 1.0 的语义
 
     @property
-    def session(self) -> ChatSession:
-        return self.server.session  # type: ignore[attr-defined]
+    def manager(self) -> SessionManager:
+        return self.server.manager  # type: ignore[attr-defined]
+
+    @property
+    def session(self) -> Session:
+        return self.manager.current()
 
     # ---------- 同源校验 ----------
     #
-    # 这个服务没有登录态，但**「本机 」不等于「只有我能访问」**：
+    # 这个服务没有登录态，但**「本机」不等于「只有我能访问」**：
     #   1. DNS rebinding —— 恶意页面把自己的域名解析到 127.0.0.1，浏览器就会带着
     #      攻击者的 Host 来访问本机端口，读走 /api/info、甚至直接驱动 Agent；
     #   2. CSRF —— 页面虽读不到响应，但 ``fetch('http://127.0.0.1:8000/api/chat')``
@@ -405,6 +156,9 @@ class Handler(BaseHTTPRequestHandler):
     #
     # 两道闸都靠**浏览器自己带的头**，不靠猜：Host 必须落在这台机器真实可被叫到的
     # 名字里；POST 必须同源。两条都不影响 curl（它本来就不是被攻击的目标）。
+    #
+    # 新增的写接口全部走 ``mutating=True`` 这一条——这就意味着**任何**改状态的请求
+    # 都被这两道闸罩住，不存在「忘了加校验」的新接口。
 
     def _allowed_hosts(self) -> set[str]:
         """这台机器当前**可以**被叫到的名字。"""
@@ -457,14 +211,24 @@ class Handler(BaseHTTPRequestHandler):
             self._send_file(INDEX_FILE)
         elif path.startswith("/static/"):
             self._send_static(path[len("/static/") :])
+        elif path == "/favicon.ico":
+            self._send_file(STATIC_DIR / "favicon.svg")
         elif path == "/api/info":
-            self._send_json(self.session.info())
+            self._send_json(self._info())
         elif path == "/api/hot":
             # 拉不到就返回空 groups，前端会留着静态建议不动。这个接口不报错，
             # 首页的一块装饰不该因为外面某个服务挂了就变成红字。
             self._send_json(hot.groups_with_status())
-        elif path == "/favicon.ico":
-            self._send_file(STATIC_DIR / "favicon.svg")
+        elif path == "/api/sessions":
+            self._send_json(self.manager.list_sessions())
+        elif path == "/api/session":
+            self._send_json(self.session.detail())
+        elif path == "/api/context":
+            self._send_json(self.session.context())
+        elif path == "/api/memories":
+            self._send_json(self.manager.list_facts())
+        elif path == "/api/settings":
+            self._send_json(self.manager.settings_payload())
         else:
             self._send_json({"error": "没有这个路径"}, status=404)
 
@@ -474,15 +238,96 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/api/chat":
             self._chat()
-        elif path == "/api/cancel":
-            self._send_json({"cancelled": self.session.cancel()})
-        elif path == "/api/reset":
-            self.session.reset()
-            self._send_json({"ok": True})
-        else:
-            self._send_json({"error": "没有这个路径"}, status=404)
+            return
+
+        try:
+            payload = self._read_json()
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+
+        # 下面这些都会改状态，全部包在一处 try 里：会话层抛 SessionError 就是
+        # 用户填错了（4xx），别的异常让它照常炸成 500——那才是程序写错了。
+        try:
+            if path == "/api/cancel":
+                self._send_json({"cancelled": self.session.cancel()})
+            elif path == "/api/reset":
+                self.session.reset()
+                self._send_json({"ok": True, "session": self.session.detail()})
+            elif path == "/api/sessions/new":
+                inherit = payload.get("inherit")
+                session = self.manager.new(None if inherit is None else bool(inherit))
+                self._send_json(session.detail())
+            elif path == "/api/sessions/select":
+                session = self.manager.select(str(payload.get("id") or ""))
+                self._send_json(session.detail())
+            elif path == "/api/sessions/rename":
+                self.manager.rename(str(payload.get("id") or ""), str(payload.get("title") or ""))
+                self._send_json(self.manager.list_sessions())
+            elif path == "/api/sessions/pin":
+                self.manager.pin(str(payload.get("id") or ""), bool(payload.get("pinned")))
+                self._send_json(self.manager.list_sessions())
+            elif path == "/api/sessions/delete":
+                result = self.manager.delete(
+                    str(payload.get("id") or ""), bool(payload.get("with_memories"))
+                )
+                self._send_json({**result, "sessions": self.manager.list_sessions()})
+            elif path == "/api/sessions/clear":
+                count = self.manager.clear_all(str(payload.get("confirm") or ""))
+                self._send_json({"cleared": count, "sessions": self.manager.list_sessions()})
+            elif path == "/api/memories/add":
+                fact = self.manager.add_fact(
+                    str(payload.get("content") or ""),
+                    str(payload.get("category") or "other"),
+                )
+                self._send_json({"fact": fact.to_dict(), "memories": self.manager.list_facts()})
+            elif path == "/api/memories/update":
+                fact = self.manager.update_fact(
+                    str(payload.get("id") or ""),
+                    content=payload.get("content"),
+                    category=payload.get("category"),
+                    disabled=payload.get("disabled"),
+                )
+                self._send_json({"fact": fact.to_dict(), "memories": self.manager.list_facts()})
+            elif path == "/api/memories/delete":
+                self.manager.delete_fact(str(payload.get("id") or ""))
+                self._send_json({"memories": self.manager.list_facts()})
+            elif path == "/api/memories/clear":
+                self._send_json(
+                    {"cleared": self.manager.clear_facts(), "memories": self.manager.list_facts()}
+                )
+            elif path == "/api/settings":
+                # 收两种写法：``{"values": {...}}`` 和直接 ``{key: value}``。
+                # 前端那一个地方顺手写成后者是很自然的事，为此回一个 400 属于自找麻烦。
+                values = payload.get("values")
+                self._send_json(
+                    self.manager.update_settings(values if isinstance(values, dict) else payload)
+                )
+            else:
+                self._send_json({"error": "没有这个路径"}, status=404)
+        except SessionError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+        except Exception:
+            logger.exception("处理 %s 时出错", path)
+            self._send_json({"error": "服务端错误"}, status=500)
 
     # ---------- 各路由的实现 ----------
+
+    def _info(self) -> dict[str, Any]:
+        session = self.session
+        tools = session.agent.tools.names()
+        return {
+            "version": __version__,
+            "provider": self.manager.config.provider,
+            "model": self.manager.config.model,
+            "tools": tools,
+            "max_steps": self.manager.config.max_steps,
+            "stream": self.manager.config.stream,
+            "workspace": self.manager.config.workspace_dir,
+            "suggestions": [q for q, tool in SUGGESTIONS if tool in tools][:_MAX_SUGGESTIONS],
+            "session": session.brief(),
+            "settings": self.manager.settings,
+        }
 
     def _chat(self) -> None:
         try:
@@ -496,7 +341,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "message 不能为空"}, status=400)
             return
 
-        logger.info("提问：%s", message[:120])
+        # 允许指定会话：页面上开着的是哪个会话就发到哪个。不传则用当前的。
+        # 少了这个，两个标签页开着不同会话时，后发的那个会悄悄写进另一个会话里。
+        wanted = str(payload.get("session") or "")
+        try:
+            session = self.manager.select(wanted) if wanted else self.session
+        except SessionError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+
+        logger.info("提问（会话 %s）：%s", session.id[:8], message[:120])
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache, no-transform")
@@ -504,7 +358,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         try:
-            for name, data in self.session.chat(message):
+            for name, data in session.chat(message):
                 self._sse(name, data)
         except (BrokenPipeError, ConnectionResetError):
             # 用户关了页面。session.chat 的 finally 会顺手把这轮停掉。
@@ -605,16 +459,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-turns", dest="max_turns", type=int, help="记忆保留的最大轮数（默认 20）"
     )
     parser.add_argument("--workspace", dest="workspace_dir", help="文件工具的工作目录")
+    parser.add_argument("--db", dest="db_path", help="会话与记忆的库文件（默认 data/memory.db）")
     parser.add_argument("--log-file", dest="log_file", help="把 DEBUG 日志写到文件")
     parser.add_argument("-v", "--verbose", action="store_true", help="把每一步也打到控制台")
     return parser
 
 
-def serve(config: Config, host: str, port: int) -> WebServer:
-    """起服务（不阻塞）。测试直接拿这个 server 对象跑，不用另起进程。"""
+def serve(config: Config, host: str, port: int, store: Store | None = None) -> WebServer:
+    """起服务（不阻塞）。测试直接拿这个 server 对象跑，不用另起进程。
+
+    ``store`` 是留给测试的口子：单元测试要的是一份干净的、彼此隔离的库，
+    不能让他们往开发者本机那个 ``data/memory.db`` 里写东西。生产路径传 None，
+    由 :class:`~agent.store.Store` 自己决定落在哪。
+    """
     config.stream = True  # 网页要的就是边生成边看；关掉流式这个界面就没意义了
-    session = ChatSession(config)
-    server = WebServer((host, port), session)
+    manager = SessionManager(config, store)
+    server = WebServer((host, port), manager)
     logger.info("已监听 http://%s:%d", host, port)
     return server
 
@@ -632,7 +492,7 @@ def main(argv: list[str] | None = None) -> int:
         print("（可以先跑 python -m web.server --provider mock 离线看看界面）\n", file=sys.stderr)
 
     try:
-        server = serve(config, args.host, args.port)
+        server = serve(config, args.host, args.port, Store(args.db_path))
     except OSError as exc:
         print(f"启动失败：{exc}", file=sys.stderr)
         return 2
@@ -653,6 +513,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\n已停止。")
     finally:
         server.server_close()
+        server.manager.close()
     return 0
 
 

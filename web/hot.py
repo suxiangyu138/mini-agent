@@ -166,9 +166,25 @@ def to_question(title: str) -> str:
     return f"「{body}」大家是怎么讨论的？"
 
 
+#: HN 的 ``url`` 字段是投稿人随手填的。``javascript:`` / ``data:`` 这类进了问句，
+#: 就会被当成「来源」原样递给模型、再喂回 ``http_request``。工具层确实有一道
+#: scheme 白名单（``http.py::_check_url``），但那条不变式属于工具层——
+#: 本层的出口不该隔着一个模块去依赖它。所以在这里自己收干净。
+_SAFE_SCHEMES = ("http://", "https://")
+
+
 def link_of(story: dict[str, Any]) -> str:
-    """原文链接。Ask HN 这类帖子没有 ``url``，退回 HN 讨论页。"""
-    return story.get("url") or f"{_DISCUSS}{story.get('id')}"
+    """原文链接。Ask HN 这类帖子没有 ``url``，退回 HN 讨论页。
+
+    不是 http(s) 的一律当没有——宁可退回讨论页，也不把一段来源不明的
+    scheme 当成「原文链接」交出去。
+    """
+    url = str(story.get("url") or "").strip()
+    if url.lower().startswith(_SAFE_SCHEMES):
+        return url
+    if url:
+        logger.info("丢弃无法识别的链接 %r，退回讨论页", url[:80])
+    return f"{_DISCUSS}{story.get('id')}"
 
 
 def _build() -> list[dict[str, Any]]:

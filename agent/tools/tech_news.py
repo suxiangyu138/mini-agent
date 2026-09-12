@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -65,28 +66,12 @@ class HackerNewsTool(BaseTool):
         self.timeout = timeout
 
     def run(self, board: str = "top", count: int = 8) -> str:
-        which = (board or "top").strip().lower()
-        if which not in _LISTS:
-            raise ToolError(f"board 只能是 {'/'.join(_LISTS)}，收到「{board}」")
-
         limit = min(max(int(count or 8), 1), 20)
-        ids = get_json(
-            f"{_BASE}/{_LISTS[which]}.json",
-            timeout=self.timeout,
-            service="Hacker News 榜单",
-        )
-        if not isinstance(ids, list) or not ids:
-            raise ToolError("Hacker News 榜单是空的，稍后再试")
+        items = fetch_stories(board=board, limit=limit, timeout=self.timeout)
+        which = (board or "top").strip().lower()
 
-        wanted = ids[:limit]
-        # 榜单顺序就是排名顺序；并发取但结果按原顺序摆回来
-        with ThreadPoolExecutor(max_workers=min(len(wanted), 8)) as pool:
-            items = list(pool.map(self._item, wanted))
-
-        lines = [f"Hacker News「{which}」榜前 {len(wanted)} 条", ""]
+        lines = [f"Hacker News「{which}」榜前 {len(items)} 条", ""]
         for index, item in enumerate(items, 1):
-            if not item:
-                continue
             title = one_line(item.get("title") or item.get("text"), 160) or "(无标题)"
             link = item.get("url") or f"{_DISCUSS}{item.get('id')}"
             host = urlsplit(item["url"]).hostname or "" if item.get("url") else ""
@@ -103,18 +88,54 @@ class HackerNewsTool(BaseTool):
             )
         return "\n".join(lines)
 
-    def _item(self, item_id: Any) -> dict[str, Any] | None:
-        """单条取不到就跳过——一条挂了不该让整份榜单失败。"""
-        try:
-            data = get_json(
-                f"{_BASE}/item/{item_id}.json",
-                timeout=self.timeout,
-                service="Hacker News 详情",
-            )
-            return data if isinstance(data, dict) else None
-        except ToolError as exc:
-            logger.debug("HN 条目 %s 取不到：%s", item_id, exc)
-            return None
+
+def fetch_stories(
+    board: str = "top",
+    limit: int = 8,
+    timeout: float = 15.0,
+) -> list[dict[str, Any]]:
+    """取榜单详情，返回结构化条目——顺序就是名次顺序，取不到的条目直接跳过。
+
+    单拎成模块级函数是为了让 :mod:`web.hot` 也能用：那边要的是标题和链接本身，
+    不是 :meth:`HackerNewsTool.run` 排好给人看的那段文本。取数逻辑只留这一份。
+    """
+    which = (board or "top").strip().lower()
+    if which not in _LISTS:
+        raise ToolError(f"board 只能是 {'/'.join(_LISTS)}，收到「{board}」")
+
+    ids = get_json(
+        f"{_BASE}/{_LISTS[which]}.json",
+        timeout=timeout,
+        service="Hacker News 榜单",
+    )
+    if not isinstance(ids, list) or not ids:
+        raise ToolError("Hacker News 榜单是空的，稍后再试")
+
+    wanted = ids[: max(1, limit)]
+    # 榜单顺序就是排名顺序；并发取但结果按原顺序摆回来。
+    #
+    # 并发上限 16 是实测定的：单条要 ~1 秒，是网络路径的固有延迟（不是 HN 慢），
+    # 所以总耗时约等于「延迟 × 轮数」，要压的是轮数。30 条的实测：
+    # 8 并发 5.2s → 16 并发 3.8s → 24 并发 3.9s → 30 并发 3.7s。
+    # 16 之后基本就平了，再往上只是多开连接。对面是 Firebase 托管的静态
+    # JSON，没必要为那零点几秒多占它 14 个连接。
+    with ThreadPoolExecutor(max_workers=min(len(wanted), 16)) as pool:
+        items = list(pool.map(partial(_story, timeout=timeout), wanted))
+    return [item for item in items if item]
+
+
+def _story(item_id: Any, timeout: float) -> dict[str, Any] | None:
+    """单条取不到就跳过——一条挂了不该让整份榜单失败。"""
+    try:
+        data = get_json(
+            f"{_BASE}/item/{item_id}.json",
+            timeout=timeout,
+            service="Hacker News 详情",
+        )
+        return data if isinstance(data, dict) else None
+    except ToolError as exc:
+        logger.debug("HN 条目 %s 取不到：%s", item_id, exc)
+        return None
 
 
 def build_tools(config: Any = None) -> list[BaseTool]:

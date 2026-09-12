@@ -44,6 +44,7 @@ if str(ROOT) not in sys.path:  # 支持 `python web/server.py` 直接跑，不�
 from agent import Agent, AgentResult, StepRecord, __version__  # noqa: E402
 from config import Config, setup_logging  # noqa: E402
 from main import build_agent, cli_overrides  # noqa: E402
+from web import hot  # noqa: E402
 
 logger = logging.getLogger("web")
 
@@ -458,6 +459,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_static(path[len("/static/") :])
         elif path == "/api/info":
             self._send_json(self.session.info())
+        elif path == "/api/hot":
+            # 拉不到就返回空 groups，前端会留着静态建议不动。这个接口不报错，
+            # 首页的一块装饰不该因为外面某个服务挂了就变成红字。
+            self._send_json(hot.groups_with_status())
         elif path == "/favicon.ico":
             self._send_file(STATIC_DIR / "favicon.svg")
         else:
@@ -631,6 +636,10 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         print(f"启动失败：{exc}", file=sys.stderr)
         return 2
+
+    # 主页的热点推送要联网、且要几秒，先在后台热上（在打开浏览器之前起跑）。
+    # 放在 main 里而不是 serve 里：测试直接调 serve，不该顺带打网络。
+    hot.warm()
 
     url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '') else args.host}:{args.port}/"
     print(f"Mini-Agent Web · provider={config.provider} · model={config.model}")

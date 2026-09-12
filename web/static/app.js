@@ -836,18 +836,58 @@
 
   // ==================================================================== 启动
 
+  /** 一条建议按钮。`label` 是按钮上显示的，`payload` 是点下去真正发出去的。 */
+  function suggestionButton(label, payload) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = label;
+    button.addEventListener('click', () => {
+      // 输入框里填的是**真正发出去的那一份**，不是按钮上那行简写：
+      // 热点推送会缀上来源链接，得让人看见到底发了什么。
+      el.input.value = payload;
+      autosize();
+      ask(payload);
+    });
+    return button;
+  }
+
+  /** 静态建议：`/api/info` 给的一串问句（服务端已按「工具注册了才出现」筛过）。 */
   function renderSuggestions() {
     el.suggestions.replaceChildren();
     for (const question of state.info.suggestions) {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.textContent = question;
-      button.addEventListener('click', () => {
-        el.input.value = question;
-        autosize();
-        ask(question);
-      });
-      el.suggestions.appendChild(button);
+      el.suggestions.appendChild(suggestionButton(question, question));
+    }
+  }
+
+  /** 实时热点。拉到了就按分组铺开，拉不到就什么都不动，留着静态建议。 */
+  async function renderHot() {
+    let data;
+    try {
+      data = await (await fetch('/api/hot')).json();
+    } catch {
+      return; // 拿不到就退回静态建议，首页没必要为此显示一行错误
+    }
+    const groups = (data && data.groups) || [];
+    if (!groups.length) return; // 一条都没推出来，静态建议留着更稳妥
+
+    el.suggestions.replaceChildren();
+    for (const group of groups) {
+      const head = document.createElement('div');
+      head.className = 'sug-group';
+      head.textContent = group.label;
+      if (data.stale) {
+        head.classList.add('sug-stale');
+        head.title = '这次没刷新成功，显示的是上一次拿到的内容';
+      }
+      el.suggestions.appendChild(head);
+      for (const item of group.items) {
+        // 问句后面必须缀上来源链接：模型手里没有联网搜索工具（那要配 API Key），
+        // 只有 http_request。不给它 URL，它就只能凭记忆答，
+        // 而推送的恰恰都是训练数据之后的事——那正是最容易编的地方。
+        const payload =
+          item.question + '\n\n来源：' + item.url + '（' + item.meta + '）';
+        el.suggestions.appendChild(suggestionButton(item.question, payload));
+      }
     }
   }
 
@@ -871,6 +911,7 @@
     el.chip.title = `${state.info.provider} / ${state.info.model} · 最多 ${state.info.max_steps} 步`;
     renderSuggestions();
     renderTools();
+    renderHot(); // 不 await：主页先出来，热点随后把静态建议换掉
   }
 
   // ---- 事件绑定 ----

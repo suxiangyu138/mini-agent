@@ -220,7 +220,7 @@ class ExchangeRateTool(BaseTool):
 
         note = f"（open.er-api，更新于 {data.get('time_last_update_utc', '未知时间')}）"
         if day:
-            note += f"　⚠️ {base} 这类货币没有历史汇率，这里给的是最新价，不是 {day} 的"
+            note += f"　注意：{base} 这类货币没有历史汇率，这里给的是最新价，不是 {day} 的"
         if missing:
             note += f"　（没有 {'、'.join(missing)} 的数据）"
         return self._format(base, amount, rates, note.strip())

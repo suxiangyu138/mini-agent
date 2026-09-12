@@ -447,6 +447,19 @@ body:hover ::-webkit-scrollbar-thumb { background: rgba(24, 24, 27, 0.14); }
   transform: translateY(-1px);
 }
 
+/* 热点推送的分组标题。和按钮不是一个层级，所以小一号、淡一档，
+   并和上一组拉开点距离——不然一列看下来会读成一长串。 */
+.sug-group {
+  margin-top: 7px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--fg-3);
+}
+.sug-group:first-child { margin-top: 0; }
+/* 这一轮没刷新成功、显示的是上次结果时，在标题后面缀一句 */
+.sug-stale::after { content: " · 未刷新"; }
+
 /* ---------------------------------------------------------------- 输入区 */
 
 .composer { padding: 10px 20px 18px; }

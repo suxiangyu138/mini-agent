@@ -15,6 +15,15 @@ dev = ["pytest>=7.4"]
 [tool.ruff]
 target-version = "py310"
 line-length = 100
+# ruff 默认尊重 .gitignore，而 tests/ 是按仓库主人的要求忽略掉的——结果就是
+# 「ruff check .」一直静默跳过整个测试目录（43 个 .py 只扫了 27 个），
+# 连下面那条 tests/*.py 的 per-file-ignores 都从没生效过。测试不提交，
+# 但写的时候照样得守同一套格式，所以这里关掉 gitignore 过滤。
+# ruff 自带的默认排除表（.venv / build / dist / node_modules 等）不受影响。
+respect-gitignore = false
+# 唯一要补回来的例外：文件工具的沙箱目录，模型跑一次就可能往里写 .py。
+# 那是运行产物不是源码，不该被当成项目代码检查。
+extend-exclude = ["workspace"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "RUF"]
@@ -49,6 +58,9 @@ words = [
     # 公共 API 工具用到的服务名
     "openalex", "crossref", "pubmed", "coingecko", "frankfurter", "openlibrary",
     "nager", "meteo", "zippopotam", "er-api", "wmo",
+    # 热点推送关键词表里的技术名词
+    "llms", "agentic", "finetuning", "multimodal", "clickhouse", "syscall",
+    "postgresql", "mongodb", "rabbitmq", "elasticsearch", "serverless", "nginx",
     # 前端：公式排版库及其 CDN
     "katex", "jsdelivr", "woff",
 ]

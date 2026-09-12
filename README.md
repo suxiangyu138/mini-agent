@@ -1,20 +1,18 @@
 # Mini-Agent
 
-一个**可运行、可扩展、结构清晰**的通用 Agent 框架（Python）。
-
-它是「能跑起来的最小完整形态」：ReAct 主循环 + 工具调用 + 可插拔模型层 + 记忆管理，
-四层职责分明、依赖单向，后续加 RAG、多 Agent、规划能力时不用推倒重来。
+一个通用 Agent 框架（Python）：ReAct 主循环 + 工具调用 + 可插拔模型层 + 记忆管理。
+四层职责分明、依赖单向，后续加 RAG、多 Agent、规划时不用推倒重来。
 
 ```bash
 pip install -r requirements.txt
-python main.py --demo              # 离线演示：不需要 API Key，直接看多步工具调用
+python main.py --demo              # 离线演示：不需要 API Key
 python main.py --list-models       # 看这家厂商有哪些模型可用（顺便验 Key）
-python -m web.server               # 打开浏览器界面，实时显示 token 用量与速度
+python -m web.server               # 浏览器界面，实时显示 token 用量与速度
 ```
 
-内置 16 个工具，**除 `web_search` 外全部免 Key**——天气、汇率、币价、论文检索、
-国别统计、Hacker News、法定假期、图书检索装好就能用（当然还是得先配一个模型后端）。
-清单见 §4。
+内置 17 个工具，**除 `web_search` 外全部免 Key**（`web_search` 要配 Tavily Key，
+没配就不注册）——天气、汇率、币价、论文检索、国别统计、Hacker News、法定假期、
+图书检索装好就能用。清单见 §4。
 
 ---
 
@@ -54,8 +52,8 @@ python -m web.server               # 打开浏览器界面，实时显示 token 
 pip install -r requirements.txt
 ```
 
-只需要 `anthropic`（Claude）和 `requests`（OpenAI 兼容协议 + 联网工具）。
-两者都是可选的：只跑 `--demo` 或 `--provider ollama` 时一个都不需要也能装上。
+只有两个依赖：`anthropic`（Claude 官方 SDK）和 `requests`（OpenAI 兼容协议 + 联网工具）。
+都装了最省事，但只跑 `--demo` 或 `--provider ollama` 的话一个都用不上。
 
 ### 2.2 零配置试跑（不需要 API Key）
 
@@ -147,22 +145,21 @@ token、跑得多快。
   ── 输入 4,016 tokens · 输出 122 tokens · 速度 42.0 tok/s · 缓存 3,968 · 首字 2.68s · 2 步 · 2.91s
 ```
 
-（上面是真实跑出来的一轮，DeepSeek `deepseek-v4-pro`。鼠标停在指标条上会展开完整口径：
-`122 tokens ÷ 模型耗时 2.91s（来源：模型层，含首字等待）`。这一轮里厂商把 122 个 token
-攒成几个批次发出来，解码窗口只有 0.45s，所以「只看解码窗口」那行**不显示**——见下面第 5 条。）
+（真实跑的一轮，DeepSeek `deepseek-v4-pro`。指标条上悬停会展开每一项的算式来源。）
 
-界面背后只有三个接口，想自己接别的界面照这个来就行：
+界面背后只有这几个接口：
 
 | 接口 | 说明 |
 |---|---|
 | `GET /api/info` | 当前 provider / model / 工具清单 / 建议问题（只列真能用的工具对应的） |
+| `GET /api/hot` | 主页的实时热点（Hacker News 现拉的，按兴趣分组）。拉不到就返回空 groups，前端留用静态建议 |
 | `POST /api/chat` | 提问。响应是 **SSE 流**，事件有 `text`（增量文字）、`step`（一次工具调用）、`done`（含指标）、`error` |
 | `POST /api/cancel` | 中断正在跑的那一轮。另有 `POST /api/reset` 清空历史 |
 
 用 SSE 而不是 WebSocket，是因为它只要一个 `POST` 加 `ReadableStream` 就能消费
 （`EventSource` 只支持 GET，发不了消息体），代价是单向——但这个场景本来就只需要单向。
 
-**指标口径**（这几个数很容易算错，所以明确写下来）：
+**指标口径**（这几个数很容易算错，所以写清楚）：
 
 | 指标 | 定义 | 为什么这么定 |
 |---|---|---|
@@ -201,12 +198,42 @@ token、跑得多快。
 - **渲染失败降级成源码**：宁可让人看见 `\frac{1}{2}` 原文，也不能显示一堆红字或干脆空白。
   CDN 没加载出来走的是同一条路——所以断网时公式显示成源码，其余照常渲染。
 
-流式输出**刻意不做边收边渲染**：生成期间只往 DOM 里塞纯文本（`textContent` 不过
-HTML 解析，最快也最安全），等这一段说完再整体换成渲染好的。这样结构上就不存在
-「公式渲染到一半闪一下」这类问题，也就不需要一套流式状态机。
+流式输出**刻意不做边收边渲染**：生成期间只往 DOM 塞纯文本（`textContent` 不过 HTML
+解析，最快也最安全），说完一段再整体换成渲染好的。这样就不存在「公式渲染到一半闪一下」
+这类问题，也就不需要一套流式状态机。
 
-另外，提示词里写明了格式约定（公式用 LaTeX、代码块标语言、表格列数对齐、不输出 HTML）——
+提示词里还写明了格式约定（公式用 LaTeX、代码块标语言、表格列数对齐、不输出 HTML）——
 让模型一开始就写对，比事后容错便宜得多。
+
+### 2.7 主页的实时热点推送
+
+首屏的建议问题默认是静态的（`web/server.py` 的 `SUGGESTIONS`，每条挂着一个它真会用到
+的工具，工具没注册就不出现）。页面加载完后再异步拉一次 `GET /api/hot`，拿到就把静态
+建议换成 Hacker News 此刻在聊的东西，按兴趣分组：
+
+```
+AI / 大模型
+   「A misalignment of AI in mathematics」是怎么回事？
+后端 / 基础设施
+   「A Design Space Exploration of Async/Await」是怎么回事？
+```
+
+几个决定：
+
+- **问句一定带来源链接**。没有 `web_search`（要配 Tavily Key），点下去发出去的是问句
+  **加上** `来源：<url>（HN · N 分 · M 评论）`，让 `http_request` 真去读原文。不挂链接
+  就是在系统性地诱导模型凭记忆编造时事，而推送的内容按定义就在训练数据之后。
+- **不阻塞首屏**。独立端点、前端开机后才拉，服务启动时还会后台预热一次
+  （冷启动实测约 4.6 秒，之后一个 TTL 内都是缓存命中）。
+- **拉不到就什么都不做**。失败返回空 groups，前端留用静态建议；有旧结果就沿用并标
+  `stale`（界面显示「未刷新」）。首页永远不会空，也不会蹦红字。
+- **关键词按词边界匹配**。`ai` 不能命中 said / email / chair，`ml` 不能命中 html / xml
+  ——误判会直接摆到主页上，比少推一条难看得多。词表见 `web/hot.py`。
+
+> **前提是 `http_request` 真能读到原文。** 开着代理 fake-ip 模式时读链接会整体失败
+> （见 §9），此时 Agent 会如实说明没读到原文——不会编，但成色打折。**不能靠「把推送
+> 的域名自动加白名单」绕过**：热点域名每小时都在变，而且 HN 是用户投稿站，
+> 那等于让陌生人决定你本机能访问哪些地址。
 
 ---
 
@@ -283,7 +310,7 @@ cp config.example.json config.json
 > 而不是拆三个工具。**每个工具的 Schema 都会跟着每一次请求发给模型**，
 > 工具多了既费 token 又让模型选不准。
 
-### 加一个新工具（3 步，其它地方一行不用改）
+### 加一个新工具（两步，其它地方一行不用改）
 
 ```python
 # agent/tools/quote.py
@@ -318,7 +345,7 @@ from . import calculator, datetime_tool, file_io, http, search, quote
 _BUILDERS = (calculator, datetime_tool, file_io, http, search, quote)
 ```
 
-**工具的三条铁律**（§三.2）：
+**工具的三条铁律**：
 
 1. **三要素齐全**：`name` / `description` / `parameters`（JSON Schema），少一个注册时就报错。
 2. **永远返回字符串，永远不抛异常**：可预期的失败抛 `ToolError`，注册中心会把它转成
@@ -369,7 +396,7 @@ LLMResponse(content="...", tool_calls=[ToolCall(id, name, arguments)], stop_reas
 └───────────────────────────────────────────────
 ```
 
-三层兜底，缺一不可：
+五处兜底，各管一种失败：
 
 | 风险 | 兜底 | 位置 |
 |---|---|---|
@@ -398,16 +425,13 @@ mini-agent/
 │   ├── prompt.py        # 提示词集中管理
 │   └── tools/
 │       ├── base.py      # 工具基类 + 注册中心
-│       ├── net.py       # 公共 API 工具共用的取数helper（不是工具模块）
-│       ├── calculator.py
-│       ├── datetime_tool.py
-│       ├── file_io.py
-│       ├── http.py
-│       ├── search.py
+│       ├── net.py       # 公共 API 工具共用的取数 helper（不是工具模块）
+│       ├── calculator.py / datetime_tool.py / file_io.py / http.py / search.py
 │       └── （公共 API）weather / academic / world_bank / crypto /
 │           exchange_rate / tech_news / books / holidays / fun
 ├── web/                 # 入口层之二：浏览器界面
 │   ├── server.py        #   HTTP + SSE，指标计算
+│   ├── hot.py           #   主页的实时热点推送（见 §2.7）
 │   └── static/          #   index.html / style.css / app.js（无构建、无依赖；
 │                        #   唯一外部依赖是 KaTeX，CDN + SRI，见 §2.6）
 ├── tests/               # pytest，全程离线（不联网、不需要 Key）※ 未提交，见 .gitignore
@@ -426,24 +450,17 @@ mini-agent/
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest -q          # 355+ 用例，全部离线
+python -m pytest -q          # 391+ 用例，全部离线
 python -m ruff check .
 ```
 
-> **注意**：`tests/` 目录按仓库主人的要求没有提交（见 `.gitignore`），
-> 所以 clone 下来直接跑 `pytest` 会找不到用例。这份文档保留在这里是为了说明
-> 测试覆盖了什么；想要测试文件就把 `.gitignore` 里的 `tests/` 那一行删掉。
+> **注意**：`tests/` 按仓库主人的要求没有提交（见 `.gitignore`），clone 下来直接跑
+> `pytest` 会找不到用例。这一节留着是为了说明测试覆盖了什么；想要测试文件就删掉
+> `.gitignore` 里 `tests/` 那一行。
 
-测试用 `MockLLM` 的**脚本模式**（想让它说什么就返回什么），所以主循环的每一步都可确定复现。
-`tests/test_web.py` 会真的把服务器起在一个随机空闲端口上——HTTP 这一层的坑只有真发请求才踩得到。
+测试用 `MockLLM` 的**脚本模式**（想让它说什么就返回什么），每一步都可确定复现。
+`tests/test_web.py` 真的把服务器起在随机空闲端口上——HTTP 这层的坑只有真发请求才踩得到。
 `tests/test_end_to_end.py` 逐条对照验收标准：
-
-前端的渲染逻辑在 `tests/render_check.mjs`（`node tests/render_check.mjs`，
-`pytest` 里也会带着跑，没装 node 就跳过）。它把 `app.js` 里渲染那一段**原文切出来**再测，
-测的是真正在跑的那份代码，不是抄出来的副本——重点覆盖公式定界符和货币符号的判别。
-另外 `tests/test_render.py` 用 Python 直接查文件，守住几条「注释里写了、改坏了却看不见」的性质：
-全文件只有一处 `innerHTML`、KaTeX 钉版本且带 SRI、提示词里有格式约定。
-`tests/make_render_preview.py` 能生成一张渲染预览页，把各种畸形输入一次摆开看效果。
 
 | 验收标准 | 对应测试 |
 |---|---|
@@ -453,6 +470,14 @@ python -m ruff check .
 | 4. 上下文过长不崩 | `test_criterion_4_long_context_does_not_crash` |
 | 5. 工具报错不崩 | `test_criterion_5_tool_error_keeps_the_agent_alive` |
 | 6. 全过程可追溯 | `test_criterion_6_every_step_is_traceable` |
+
+前端的渲染逻辑由 `tests/render_check.mjs` 测（`pytest` 带着跑，没装 node 就跳过）：
+它把 `app.js` 里渲染那一段**原文切出来**再测，测的是真正在跑的代码，不是抄出来的副本。
+`tests/test_render.py` 直接查文件，守几条「注释里写了、改坏了却看不见」的性质：
+只有一处 `innerHTML`、KaTeX 钉版本且带 SRI、提示词里有格式约定。
+`tests/make_render_preview.py` 生成一张预览页，把各种畸形输入一次摆开看效果。
+`tests/test_source_style.py` 是全项目的风格不变量——**源码里不许出现 emoji**。
+它不会让任何功能用例变红，所以得单独盯着。
 
 ---
 

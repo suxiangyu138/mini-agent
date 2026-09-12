@@ -54,6 +54,14 @@ class BaseTool(ABC):
     description: str = ""
     parameters: dict[str, Any] = _EMPTY_SCHEMA
 
+    #: 结果是否受 ToolRegistry 的长度上限约束（``max_result_chars``）。
+    #:
+    #: **取内容的工具**（http_request、read_file）设 False：正文就是答案本身，
+    #: 砍掉一半比没有更糟——模型会拿半截内容当完整内容用，还照样据此下结论。
+    #: 这类工具自己交代长度：read_file 有显式的 ``max_bytes`` 参数，
+    #: http_request 在头部报出正文字符数。
+    truncate_result: bool = True
+
     def schema(self) -> dict[str, Any]:
         """导出给模型的 JSON Schema（统一格式，适配器负责翻译成各家字段）。"""
         return {
@@ -163,6 +171,10 @@ class ToolRegistry:
         if raw is None:
             return ToolResult(f"工具 {name} 没有返回内容（工具必须返回字符串）", is_error=True)
 
+        # getattr 而不是直接取属性：这个注册中心收「长得像工具」的类（鸭子类型），
+        # 新工具不必继承 BaseTool，也就未必带这个开关。缺省按有上限处理。
+        if not getattr(tool, "truncate_result", True):
+            return ToolResult(str(raw), is_error=False)
         text, truncated = self._truncate(str(raw))
         return ToolResult(text, is_error=False, truncated=truncated)
 

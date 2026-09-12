@@ -60,6 +60,9 @@ class _WorkspaceTool(BaseTool):
 
 class ReadFileTool(_WorkspaceTool):
     name = "read_file"
+    #: 文件正文是答案本身，不叠加工具层的长度上限。
+    #: 长度由本工具自己的 max_bytes 参数控制，那个上限是显式的、模型能看见也能调大。
+    truncate_result = False
     description = (
         "读取工作目录内的文本文件内容。\n"
         "路径相对于工作目录，例如 notes/todo.md 或 data/sales.csv。\n"

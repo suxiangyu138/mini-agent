@@ -27,7 +27,6 @@ from .base import BaseTool, ToolError
 
 logger = logging.getLogger(__name__)
 
-_MAX_BODY_CHARS = 8000
 _ALLOWED_SCHEMES = ("http", "https")
 _ALLOWED_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD")
 
@@ -39,11 +38,14 @@ _FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 
 class HttpRequestTool(BaseTool):
     name = "http_request"
+    #: 响应体是答案本身，一律整份返回，不受工具层长度上限约束。
+    truncate_result = False
     description = (
         "发起一次 HTTP 请求并返回响应内容（状态码 + 响应体）。\n"
         "用于访问公开 API、获取网页原始内容（注意：返回的是 HTML 源码，不是解析后的正文）。\n"
         "**不能访问内网地址**（localhost、192.168.x、10.x 等会被拒绝）。\n"
-        "响应体过长会截断。需要 JSON 结果时，可以配合说明让模型自己解释响应体。"
+        "响应体**原样整份返回，不做截断**：头部会报出正文字符数，嫌大就换个更精确的 URL，"
+        "别在同一个大页面上反复请求。"
     )
     parameters = {
         "type": "object",
@@ -223,15 +225,13 @@ class HttpRequestTool(BaseTool):
             except ValueError:
                 pass  # 声明是 JSON 但解析失败，就按原文返回
 
-        truncated = len(text) > _MAX_BODY_CHARS
-        if truncated:
-            notice = f"\n……（响应体过长已截断，共 {len(response.text)} 字符）"
-            text = text[:_MAX_BODY_CHARS] + notice
-
+        # 正文原样返回，一个字都不切（见类属性 truncate_result）。
+        # 头部只报长度：不切内容，但要让模型知道这次拿回来的是多大一坨。
         return (
             f"HTTP {response.status_code} {response.reason}\n"
             f"Content-Type: {content_type or '(未声明)'}\n"
             f"最终 URL: {response.url}\n"
+            f"正文长度: {len(text)} 字符\n"
             f"{'-' * 40}\n{text}"
         )
 

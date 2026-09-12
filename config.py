@@ -137,6 +137,10 @@ class Config:
     # ---------- 工具层 ----------
     workspace_dir: str = "./workspace"
     allow_file_write: bool = True
+    # 工具结果的统一长度上限。这是**兜底**，不是内容工具的主限制：
+    # http_request 和 read_file 的正文是答案本身，它们绕开这一项照样整份返回
+    # （见 agent/tools/base.py 的 BaseTool.truncate_result），
+    # 否则模型会拿着被砍掉一半的正文当完整的用。设 0 表示不限。
     max_tool_result_chars: int = 8000
     http_allow_private: bool = False
     # 白名单：这些域名即使在保留网段也放行（子域名自动跟着放行）。

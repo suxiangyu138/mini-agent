@@ -152,18 +152,28 @@ class HttpRequestTool(BaseTool):
                     }
                     current = next_url
                     if response.status_code in (301, 302, 303):
-                        # 301/302/303 按浏览器惯例降级成 GET 并丢掉请求体；
-                        # 307/308 的语义是「原样重发」，方法与请求体都保持。
-                        # 三个实体头一并剥掉（requests 也是这么做的）：留着它们会让
-                        # 一个已经没有 body 的 GET 顶着 application/json 发出去。
+                        # 307/308 的语义是「原样重发」，下面两件事都不做。
+                        #
+                        # 一、请求体连同三个实体头一律丢掉，**不跟着方法走**——
+                        # 方法没降级的 GET/HEAD 也一样丢。留着的话，调用方塞在 body 里的
+                        # 东西会跟着一个 302 被送到跳转目标指定的主机上：和 Authorization
+                        # 是同一类漏法，只是走 body 这条路。
                         drop |= {"content-length", "content-type", "transfer-encoding"}
                         current_headers = {
                             name: value
                             for name, value in current_headers.items()
                             if name.lower() not in drop
                         }
-                        if current_verb not in ("GET", "HEAD"):
-                            current_verb, current_payload = "GET", None
+                        current_payload = None
+                        # 二、方法降级：302/303 除 HEAD 外都变 GET；301 **只**把 POST
+                        # 变 GET，PUT/PATCH/DELETE 保持原方法。这条看着别扭，但 requests
+                        # 就是这么定的（rebuild_method，对应它 issue 1704），而这个工具
+                        # 以前用 allow_redirects=True 时就是这个行为——不在这儿另立一套，
+                        # 否则「跟 requests 一致」这句话就只对一半情况成立。
+                        if current_verb != "HEAD" and (
+                            response.status_code in (302, 303) or current_verb == "POST"
+                        ):
+                            current_verb = "GET"
                 raise ToolError(f"重定向次数过多（超过 {_MAX_REDIRECTS} 次）：{target}")
         except requests.Timeout as exc:
             raise ToolError(f"请求超时（{seconds:.0f} 秒）：{target}") from exc

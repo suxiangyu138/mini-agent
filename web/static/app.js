@@ -897,6 +897,7 @@
         // 带上会话 id：页面上开着哪个会话，这一问就写进哪个。
         body: JSON.stringify({ message: question, session: state.sessionId }),
       });
+      if (bouncedToLogin(response)) return;
       if (!response.ok || !response.body) {
         renderError(turn, `请求失败（HTTP ${response.status}）`);
         return;
@@ -1049,8 +1050,22 @@
 
   // ==================================================================== 接口
 
+  /**
+   * 401 = 没登录（或者 30 天到期了）。这时候该做的是把人送回登录页，
+   * 而不是让他对着一个「未连接」的界面猜哪里坏了。
+   *
+   * 返回 true 表示已经跳走了，调用方直接返回、别再往下渲染。
+   * 换地址用 replace 而不是 assign：登录页不该占一格后退历史。
+   */
+  function bouncedToLogin(response) {
+    if (response.status !== 401) return false;
+    location.replace('/login');
+    return true;
+  }
+
   async function getJSON(path) {
     const response = await fetch(path);
+    if (bouncedToLogin(response)) throw new Error('需要登录');
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return response.json();
   }
@@ -1074,6 +1089,7 @@
     } catch {
       /* 没回 JSON（连接断了、被代理截了），下面按状态码处理 */
     }
+    if (bouncedToLogin(response)) throw new Error('需要登录');
     if (!response.ok) throw new Error((data && data.error) || `HTTP ${response.status}`);
     return data || {};
   }
@@ -1848,6 +1864,40 @@
       '长期记忆和会话历史都存在本机的 SQLite 里，不上传任何地方。' +
       '关掉「自动保存会话」只影响新写入的历史，已经存下的不会因此被删。';
     el.pageSettings.appendChild(note);
+
+    // 只有配了口令才有「退出」这回事。没配就别摆一个点了没反应的按钮——
+    // 本机用法下重新输一遍口令纯属自找麻烦。
+    if (state.info.auth) {
+      const row = document.createElement('div');
+      row.className = 'set-item';
+      const text = document.createElement('div');
+      text.className = 'set-text';
+      const label = document.createElement('div');
+      label.className = 'set-label';
+      label.textContent = '退出登录';
+      const hint = document.createElement('div');
+      hint.className = 'set-hint';
+      hint.textContent = '清掉这台浏览器上的登录状态，下次打开要重新输口令。';
+      text.append(label, hint);
+
+      const out = document.createElement('button');
+      out.type = 'button';
+      out.className = 'link-btn danger';
+      out.textContent = '退出';
+      out.addEventListener('click', async () => {
+        out.disabled = true;
+        try {
+          await postJSON('/api/logout', {});
+        } catch {
+          // 服务端没答上也照样回登录页：cookie 清没清掉是服务端的事，
+          // 但这一页不该继续开着。
+        }
+        location.replace('/login');
+      });
+
+      row.append(text, out);
+      el.pageSettings.appendChild(row);
+    }
   }
 
   // ==================================================================== 上下文状态
@@ -2022,7 +2072,9 @@
   async function boot() {
     fillIcons(document); // 先把静态 HTML 里那些 [data-icon] 占位换成图标
     try {
-      state.info = await (await fetch('/api/info')).json();
+      const response = await fetch('/api/info');
+      if (bouncedToLogin(response)) return;
+      state.info = await response.json();
     } catch {
       el.modelText.textContent = '未连接';
       return;

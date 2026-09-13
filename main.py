@@ -228,6 +228,11 @@ def cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
         overrides["stream"] = stream
     if getattr(args, "verbose", False):
         overrides["verbose"] = True
+    # --public-host 是 append 出来的列表，落到 web_public_hosts 上。
+    # 口令刻意没有对应的命令行参数：那会进 shell 历史和进程列表。
+    public_hosts = getattr(args, "public_host", None)
+    if public_hosts:
+        overrides["web_public_hosts"] = public_hosts
     return overrides
 
 

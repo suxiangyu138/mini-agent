@@ -23,6 +23,9 @@
   "enabled_tools": [],
   "disabled_tools": [],
 
+  "_web_public_hosts说明": "挂公网用的内网穿透域名，逗号分隔（也可用 --public-host）。非空则必须同时设 MINI_AGENT_WEB_ACCESS_TOKEN，否则拒绝启动。",
+  "web_public_hosts": [],
+
   "verbose": false,
   "log_file": "",
   "system_prompt_extra": ""

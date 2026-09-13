@@ -20,21 +20,35 @@
     python -m web.server                      # http://127.0.0.1:8000
     python -m web.server --port 9000 --open   # 换端口并自动开浏览器
     python -m web.server --provider zhipu     # 换模型后端
+
+**挂公网**（内网穿透，比如 cpolar）要同时给两样东西：
+
+    set MINI_AGENT_WEB_ACCESS_TOKEN=<一串随机字符>
+    python -m web.server --public-host abc123.cpolar.top
+
+前者是口令，后者告诉服务「这个域名是合法的入口」——不写的话隧道过来的请求会
+因为 Host 对不上被 403（那道校验本来是防 DNS rebinding 的）。**两样必须一起给**：
+只给域名不给口令，serve() 会直接拒绝启动。理由是这个服务没有登录态时，拿到
+URL 的人可以花你的 API 额度、翻你的对话和长期记忆、让 Agent 读写工作目录。
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import logging
 import mimetypes
 import socket
 import sys
+import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:  # 支持 `python web/server.py` 直接跑，不要求先 pip install -e .
@@ -57,9 +71,31 @@ logger = logging.getLogger("web")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
+LOGIN_FILE = STATIC_DIR / "login.html"
 
 #: 正文长度上限，防止有人往接口里灌一兆的字符串
 MAX_BODY_BYTES = 64 * 1024
+
+# --------------------------------------------------------------------------- #
+# 口令闸
+# --------------------------------------------------------------------------- #
+
+#: cookie 名。带上 mini_agent 前缀是因为挂公网时这个域名下可能不止我们一个页面，
+#: 用 token / pass 这种名字撞车的概率不低。
+_COOKIE_NAME = "mini_agent_pass"
+
+#: cookie 里放的是**口令的 HMAC，不是口令本身**。截图、共享屏幕、贴日志都会漏出
+#: cookie；而人往往到处用同一个口令，漏出去就不是这一个服务的事了。
+#: 标签写死在这里：它不参与保密，只是让这个值换个用途就对不上。
+_COOKIE_LABEL = b"mini-agent-web-v1"
+_COOKIE_MAX_AGE = 30 * 24 * 3600
+
+#: 口令试错的容忍度。**计数是全体的，不分来源**——穿透之后所有请求都是从本机
+#: 转过来的，按 IP 分等于没分。反正这服务就一个用户，锁就锁全体。
+#: 试满之后歇一分钟：挡不住决心，但足够让「一串随机字符」这件事本身成为门槛。
+_MAX_FAILURES = 10
+_LOCKOUT_SECONDS = 60
+_FAILURE_DELAY = 0.4
 
 #: 本机自己的名字，`Host` 校验用。进程启动时算一次就够。
 _LOCAL_NAMES = frozenset(
@@ -118,9 +154,41 @@ class WebServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], manager: SessionManager) -> None:
+    def __init__(
+        self,
+        address: tuple[str, int],
+        manager: SessionManager,
+        *,
+        access_token: str = "",
+        public_hosts: list[str] | None = None,
+    ) -> None:
         super().__init__(address, Handler)
         self.manager = manager
+        self.access_token = (access_token or "").strip()
+        self.public_hosts = [h.strip().lower().rstrip(".") for h in (public_hosts or []) if h]
+        #: 口令试错计数：{来源: [次数, 最后一次的时间]}。线程池里多个请求会同时碰它。
+        self.login_failures: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def note_login_failure(self, who: str) -> None:
+        with self._lock:
+            record = self.login_failures.setdefault(who, [0.0, 0.0])
+            record[0] += 1
+            record[1] = time.time()
+
+    def login_locked(self, who: str) -> bool:
+        with self._lock:
+            record = self.login_failures.get(who)
+            if not record or record[0] < _MAX_FAILURES:
+                return False
+            if time.time() - record[1] > _LOCKOUT_SECONDS:
+                del self.login_failures[who]  # 锁过期，重新给机会
+                return False
+            return True
+
+    def note_login_success(self, who: str) -> None:
+        with self._lock:
+            self.login_failures.pop(who, None)
 
     @property
     def session(self) -> Session:
@@ -146,23 +214,36 @@ class Handler(BaseHTTPRequestHandler):
     def session(self) -> Session:
         return self.manager.current()
 
-    # ---------- 同源校验 ----------
+    @property
+    def token(self) -> str:
+        """配置里的口令。空串 = 不做鉴权（只在本机用的那种用法）。"""
+        return self.server.access_token  # type: ignore[attr-defined]
+
+    @property
+    def public_hosts(self) -> list[str]:
+        return self.server.public_hosts  # type: ignore[attr-defined]
+
+    # ---------- 三道闸 ----------
     #
-    # 这个服务没有登录态，但**「本机」不等于「只有我能访问」**：
-    #   1. DNS rebinding —— 恶意页面把自己的域名解析到 127.0.0.1，浏览器就会带着
-    #      攻击者的 Host 来访问本机端口，读走 /api/info、甚至直接驱动 Agent；
-    #   2. CSRF —— 页面虽读不到响应，但 ``fetch('http://127.0.0.1:8000/api/chat')``
-    #      这种「简单请求」根本不会触发预检，照样能把请求打到我们身上。
+    # **「本机」不等于「只有我能访问」**，挂了穿透更不等于：
+    #   1. Host —— 恶意页面把自己的域名解析到 127.0.0.1（DNS rebinding），浏览器
+    #      就会带着攻击者的 Host 来访问本机端口，读走 /api/info、甚至驱动 Agent；
+    #   2. Origin —— CSRF。页面虽读不到响应，但 ``fetch('/api/chat')`` 这种
+    #      「简单请求」根本不触发预检，照样能把请求打到我们身上；
+    #   3. 口令 —— 前两道挡的是**别的网页借你的浏览器**，挡不住「知道 URL 的人
+    #      自己发请求」。挂公网必须补这一道。
     #
-    # 两道闸都靠**浏览器自己带的头**，不靠猜：Host 必须落在这台机器真实可被叫到的
-    # 名字里；POST 必须同源。两条都不影响 curl（它本来就不是被攻击的目标）。
+    # 前两道靠**浏览器自己带的头**，不靠猜：Host 必须落在真实可被叫到的名字里，
+    # POST 必须同源。两条都不影响 curl（它本来就不是被攻击的目标）。
+    # 第三道配了口令才生效，本机用法一行都不用改。
     #
     # 新增的写接口全部走 ``mutating=True`` 这一条——这就意味着**任何**改状态的请求
-    # 都被这两道闸罩住，不存在「忘了加校验」的新接口。
+    # 都被这几道闸罩住，不存在「忘了加校验」的新接口。
 
     def _allowed_hosts(self) -> set[str]:
         """这台机器当前**可以**被叫到的名字。"""
         names = set(_LOCAL_NAMES)
+        names.update(self.public_hosts)  # 穿透域名：是「我同意挂出去的入口」，不是猜的
         try:
             # 客户端连过来的那个本机地址。绑 0.0.0.0 时它就是局域网 IP，
             # 于是「局域网用 IP 访问」照常工作，而攻击者的域名仍然对不上。
@@ -171,12 +252,15 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return names
 
-    def _guard(self, *, mutating: bool) -> bool:
-        """校验通过返回 True；不通过就回 403 并返回 False。"""
+    def _guard(self, *, mutating: bool, path: str = "") -> bool:
+        """校验通过返回 True；不通过就自己回掉响应并返回 False。"""
         host = _hostname_of(self.headers.get("Host", ""))
         if host not in self._allowed_hosts():
             logger.warning("拒绝 Host=%r 的请求（疑似 DNS rebinding）", host)
             self._send_json({"error": "Host 不被接受"}, status=403)
+            return False
+
+        if not self._authorized(path):
             return False
 
         if not mutating:
@@ -201,13 +285,101 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"error": "跨站请求被拒绝"}, status=403)
         return False
 
+    # ---------- 口令 ----------
+
+    def _cookie_value(self) -> str:
+        """cookie 该带的值：口令的 HMAC（理由见 ``_COOKIE_LABEL`` 上面那段）。"""
+        return hmac.new(self.token.encode("utf-8"), _COOKIE_LABEL, hashlib.sha256).hexdigest()
+
+    def _cookies(self) -> dict[str, str]:
+        jar: dict[str, str] = {}
+        for chunk in (self.headers.get("Cookie") or "").split(";"):
+            key, sep, value = chunk.partition("=")
+            if sep:
+                jar[key.strip()] = value.strip()
+        return jar
+
+    def _authorized(self, path: str) -> bool:
+        """没配口令一律放行；配了就要求 cookie 对得上。"""
+        if not self.token or path in ("/login", "/api/login"):
+            return True  # 登录页本身要是也被拦，就没人进得来了
+        given = self._cookies().get(_COOKIE_NAME, "")
+        if given and hmac.compare_digest(given, self._cookie_value()):
+            return True
+        if path.startswith("/api/"):
+            # 前端据此跳登录页；报 403 会让它显示成「未连接」，把话说不清楚。
+            self._send_json({"error": "需要先登录", "login": "/login"}, status=401)
+        else:
+            self._redirect("/login")
+        return False
+
+    def _cookie_header(self) -> str:
+        parts = [
+            f"{_COOKIE_NAME}={self._cookie_value()}",
+            "Path=/",
+            f"Max-Age={_COOKIE_MAX_AGE}",
+            "HttpOnly",  # 页面脚本读不到，XSS 也偷不走
+            "SameSite=Lax",  # 别的站点发起的请求带不上它，CSRF 少一条路
+        ]
+        if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https":
+            # 只在确实是 https 时加：本地 http 访问加了它，浏览器会直接不存这个 cookie。
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def _login(self) -> None:
+        """表单提交口令。故意用表单而不是 JS：这样整条链路不依赖前端脚本。"""
+        if not self.token:
+            self._redirect("/")
+            return
+        who = self.address_string()
+        if self.server.login_locked(who):  # type: ignore[attr-defined]
+            logger.warning("口令试错次数超限，暂时拒绝（来自 %s）", who)
+            self._redirect("/login?error=locked")
+            return
+
+        provided = self._read_form().get("token", "")
+        if provided and hmac.compare_digest(provided, self.token):
+            self.server.note_login_success(who)  # type: ignore[attr-defined]
+            logger.info("口令验证通过（来自 %s）", who)
+            self._redirect("/", cookie=self._cookie_header())
+            return
+
+        self.server.note_login_failure(who)  # type: ignore[attr-defined]
+        logger.warning("口令不对（来自 %s）", who)
+        time.sleep(_FAILURE_DELAY)
+        self._redirect("/login?error=1")
+
+    def _logout(self) -> None:
+        # Max-Age=0 就是让浏览器立刻丢掉它。值给空串，不给 HMAC——
+        # 万一有浏览器只认值不认 Max-Age，留下的也是个对不上的空值。
+        self._send_json(
+            {"ok": True},
+            extra=(("Set-Cookie", f"{_COOKIE_NAME}=; Path=/; Max-Age=0"),),
+        )
+
+    def _read_form(self) -> dict[str, str]:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > MAX_BODY_BYTES:
+            return {}
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+        except UnicodeDecodeError:
+            return {}
+        return {key: values[0] for key, values in parse_qs(raw).items() if values}
+
     # ---------- 路由 ----------
 
     def do_GET(self) -> None:  # BaseHTTPRequestHandler 规定的名字就是大写下划线
-        if not self._guard(mutating=False):
-            return
         path = self.path.split("?", 1)[0]
-        if path in ("/", "/index.html"):
+        if not self._guard(mutating=False, path=path):
+            return
+        if path == "/login":
+            if self.token:
+                self._send_file(LOGIN_FILE)
+            else:
+                # 没配口令就没有登录这回事，别给一个永远登不进去的页面。
+                self._redirect("/")
+        elif path in ("/", "/index.html"):
             self._send_file(INDEX_FILE)
         elif path.startswith("/static/"):
             self._send_static(path[len("/static/") :])
@@ -233,11 +405,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "没有这个路径"}, status=404)
 
     def do_POST(self) -> None:
-        if not self._guard(mutating=True):
-            return
         path = self.path.split("?", 1)[0]
+        if not self._guard(mutating=True, path=path):
+            return
         if path == "/api/chat":
             self._chat()
+            return
+        if path == "/api/login":
+            self._login()  # 表单，不是 JSON：这里自己读 body，别落到下面去
+            return
+        if path == "/api/logout":
+            self._logout()
             return
 
         try:
@@ -327,6 +505,8 @@ class Handler(BaseHTTPRequestHandler):
             "suggestions": [q for q, tool in SUGGESTIONS if tool in tools][:_MAX_SUGGESTIONS],
             "session": session.brief(),
             "settings": self.manager.settings,
+            # 没配口令就别显示「退出登录」——那是个点了也没意义的按钮
+            "auth": bool(self.token),
         }
 
     def _chat(self) -> None:
@@ -364,13 +544,28 @@ class Handler(BaseHTTPRequestHandler):
             # 用户关了页面。session.chat 的 finally 会顺手把这轮停掉。
             logger.info("连接已断开")
 
-    def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
+    def _send_json(
+        self,
+        payload: dict[str, Any],
+        status: int = 200,
+        extra: tuple[tuple[str, str], ...] = (),
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in extra:
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def _redirect(self, location: str, cookie: str | None = None) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _send_file(self, path: Path) -> None:
         try:
@@ -437,6 +632,10 @@ def build_parser() -> argparse.ArgumentParser:
             "  python -m web.server                     默认 127.0.0.1:8000\n"
             "  python -m web.server --open              起来就打开浏览器\n"
             "  python -m web.server --provider zhipu    换模型后端\n"
+            "\n"
+            "挂公网（内网穿透）：\n"
+            "  set MINI_AGENT_WEB_ACCESS_TOKEN=<一串随机字符>\n"
+            "  python -m web.server --public-host abc123.cpolar.top\n"
         ),
     )
     parser.add_argument(
@@ -460,6 +659,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--workspace", dest="workspace_dir", help="文件工具的工作目录")
     parser.add_argument("--db", dest="db_path", help="会话与记忆的库文件（默认 data/memory.db）")
+    parser.add_argument(
+        "--public-host",
+        dest="public_host",
+        action="append",
+        metavar="域名",
+        help=(
+            "内网穿透的公网域名，可重复。写进来的名字才允许通过 Host 校验；"
+            "给了它就必须同时设 MINI_AGENT_WEB_ACCESS_TOKEN，否则拒绝启动。"
+            "口令本身故意没有命令行参数——那会进 shell 历史和进程列表"
+        ),
+    )
     parser.add_argument("--log-file", dest="log_file", help="把 DEBUG 日志写到文件")
     parser.add_argument("-v", "--verbose", action="store_true", help="把每一步也打到控制台")
     return parser
@@ -471,10 +681,29 @@ def serve(config: Config, host: str, port: int, store: Store | None = None) -> W
     ``store`` 是留给测试的口子：单元测试要的是一份干净的、彼此隔离的库，
     不能让他们往开发者本机那个 ``data/memory.db`` 里写东西。生产路径传 None，
     由 :class:`~agent.store.Store` 自己决定落在哪。
+
+    口令和公网域名从 ``config`` 读（命令行覆盖和环境变量在更早的地方已经汇进
+    config 了），这里只负责那条不变式：**要挂公网，就必须有口令**。
     """
     config.stream = True  # 网页要的就是边生成边看；关掉流式这个界面就没意义了
+
+    token = str(getattr(config, "web_access_token", "") or "").strip()
+    public_hosts = [str(h).strip() for h in (getattr(config, "web_public_hosts", None) or []) if h]
+
+    # 「要挂公网」和「没有口令」不能同时成立。宁可起不来，也别把一个没有登录态、
+    # 还能花你 API 额度的界面挂出去——那件事一旦发生是收不回来的。
+    if public_hosts and not token:
+        raise ValueError(
+            "配了公网域名（web_public_hosts / --public-host）却没有口令："
+            "请先设置环境变量 MINI_AGENT_WEB_ACCESS_TOKEN 再启动"
+        )
+    if token and len(token) < 12:
+        logger.warning("访问口令只有 %d 个字符，偏短；建议至少 16 位随机字符", len(token))
+
     manager = SessionManager(config, store)
-    server = WebServer((host, port), manager)
+    server = WebServer((host, port), manager, access_token=token, public_hosts=public_hosts)
+    if public_hosts:
+        logger.info("已放行公网域名：%s（口令闸已开）", ", ".join(public_hosts))
     logger.info("已监听 http://%s:%d", host, port)
     return server
 
@@ -493,7 +722,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         server = serve(config, args.host, args.port, Store(args.db_path))
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError 是「要挂公网却没给口令」这类配置错误，同样是一句话说得清的。
         print(f"启动失败：{exc}", file=sys.stderr)
         return 2
 
@@ -504,6 +734,9 @@ def main(argv: list[str] | None = None) -> int:
     url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '') else args.host}:{args.port}/"
     print(f"Mini-Agent Web · provider={config.provider} · model={config.model}")
     print(f"打开 {url}   （Ctrl+C 停止）")
+    for public in server.public_hosts:
+        # 口令一个字都不打。终端会被录屏、会被截图，而它就在上面几行之外。
+        print(f"公网入口 https://{public}/   先过口令闸（MINI_AGENT_WEB_ACCESS_TOKEN）")
     if args.open:
         webbrowser.open(url)
 

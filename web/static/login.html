@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<meta name="robots" content="noindex, nofollow">
+<title>Mini-Agent · 验证</title>
+<link rel="icon" href="/favicon.ico">
+
+<!--
+  登录页。**刻意不引用 style.css 和 app.js。**
+
+  它是在通过口令闸**之前**渲染的，而闸拦在服务端最外层：/static/ 下的文件
+  同样过不去——那是故意的，界面本体不该在没验证的时候就能拉到。所以这一页
+  必须自包含，不依赖任何外部请求，配色和圆角照 style.css 的 :root 抄一份。
+
+  登录本身也不依赖脚本：口令走原生表单 POST。脚本只负责把地址栏里的错误码
+  翻成一句话。断网、脚本被拦、密码管理器乱插东西，都还登得进去。
+-->
+
+<style>
+  :root {
+    /* 与 style.css 的 :root 同源，只留这一页用得到的几个 */
+    --bg: #f5f5f3;
+    --surface: #ffffff;
+    --line: rgba(24, 24, 27, 0.09);
+    --line-strong: rgba(24, 24, 27, 0.17);
+    --fg: rgba(24, 24, 27, 0.92);
+    --fg-2: rgba(24, 24, 27, 0.64);
+    --fg-3: rgba(24, 24, 27, 0.46);
+    --accent: #2f5fe0;
+    --accent-ink: #ffffff;
+    --accent-soft: rgba(47, 95, 224, 0.08);
+    --accent-line: rgba(47, 95, 224, 0.32);
+    --danger: #c0392b;
+    --danger-soft: rgba(192, 57, 43, 0.08);
+    --shadow-lg: 0 2px 6px rgba(24, 24, 27, 0.06), 0 28px 60px -28px rgba(24, 24, 27, 0.3);
+    --radius: 12px;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    /* 移动端地址栏收起时 100vh 会跳一下，dvh 更稳；不认的浏览器退回上一行 */
+    min-height: 100dvh;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font);
+    font-size: 15px;
+    line-height: 1.7;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .card {
+    width: 100%;
+    max-width: 340px;
+    padding: 28px 26px 24px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-lg);
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    margin-bottom: 18px;
+  }
+
+  /* 一个方块加一个点：和主页左上角的标记同一套语言，不用图片 */
+  .mark {
+    position: relative;
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
+    background: var(--accent);
+    flex: none;
+  }
+
+  .mark::after {
+    content: "";
+    position: absolute;
+    right: -2px;
+    bottom: -2px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--surface);
+    box-shadow: 0 0 0 2px var(--accent);
+  }
+
+  .brand span {
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+  }
+
+  p.hint {
+    margin: 0 0 20px;
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--fg-2);
+  }
+
+  label {
+    display: block;
+    margin-bottom: 6px;
+    font-size: 12px;
+    color: var(--fg-3);
+  }
+
+  input[type="password"] {
+    width: 100%;
+    padding: 9px 11px;
+    font: inherit;
+    font-size: 14px;
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+
+  input[type="password"]:focus {
+    border-color: var(--accent-line);
+    background: var(--surface);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+
+  button {
+    width: 100%;
+    margin-top: 12px;
+    padding: 9px 14px;
+    font: inherit;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--accent-ink);
+    background: var(--accent);
+    border: 0;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: filter 0.15s;
+  }
+
+  button:hover { filter: brightness(1.06); }
+  button:active { filter: brightness(0.95); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .error {
+    margin: 14px 0 0;
+    padding: 8px 11px;
+    font-size: 13px;
+    color: var(--danger);
+    background: var(--danger-soft);
+    border-radius: 8px;
+  }
+
+  .note {
+    margin: 18px 0 0;
+    padding-top: 14px;
+    border-top: 1px solid var(--line);
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--fg-3);
+  }
+</style>
+</head>
+<body>
+
+<main class="card">
+  <div class="brand"><i class="mark"></i><span>Mini-Agent</span></div>
+
+  <p class="hint">这个地址挂在公网上，需要一个访问口令才能进。</p>
+
+  <form method="post" action="/api/login">
+    <label for="token">访问口令</label>
+    <input id="token" name="token" type="password" autocomplete="current-password"
+           autofocus required spellcheck="false" autocapitalize="off" autocorrect="off">
+    <button type="submit">进入</button>
+  </form>
+
+  <p class="error" id="error" hidden></p>
+
+  <p class="note">
+    口令就是启动时那个环境变量 <code>MINI_AGENT_WEB_ACCESS_TOKEN</code>。
+    验证通过后本机会记住 30 天。
+  </p>
+</main>
+
+<script>
+  // 只干一件事：把服务端 302 回来时挂在地址栏上的错误码翻成人话。
+  // 没有这段，页面照样能登录——错误提示会缺，但门是通的。
+  (function () {
+    var code = new URLSearchParams(location.search).get('error');
+    if (!code) return;
+    var box = document.getElementById('error');
+    box.textContent =
+      code === 'locked'
+        ? '试错次数太多，等一分钟再试。'
+        : '口令不对。';
+    box.hidden = false;
+    document.getElementById('token').select();
+  })();
+</script>
+
+</body>
+</html>

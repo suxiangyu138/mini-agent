@@ -156,6 +156,18 @@ class Config:
     log_file: str = ""
     system_prompt_extra: str = ""
 
+    # ---------- 网页入口 ----------
+    #: 公网访问口令。**建议只放在环境变量 MINI_AGENT_WEB_ACCESS_TOKEN 里**，
+    #: 不要写进 config.json——那是个容易被顺手贴出去的文件，而这是个口令。
+    #: 留空 = 不做鉴权，只在本机用。一旦设了 web_public_hosts，这一项就是必填：
+    #: 「要挂公网」和「没有口令」不能同时成立，serve() 会直接拒绝启动。
+    #: 没有命令行参数是故意的：命令行会进 shell 历史和进程列表。
+    web_access_token: str = ""
+    #: 内网穿透的域名，如 abc123.cpolar.top。写进来的名字才允许通过 Host 校验——
+    #: 那道校验默认只认本机名字（防 DNS rebinding），隧道过来的请求 Host 对不上，
+    #: 不写在这儿会一路 403。
+    web_public_hosts: list[str] = field(default_factory=list)
+
     # ---------- 内部记账（不对外，不进 config.json） ----------
     #: 上一次套用的 provider 预设名。用来区分 model/base_url 是「预设填的」还是「用户指定的」：
     #: 换 provider 时前者要跟着换，后者必须保留，否则会拿着上个厂商的模型名去请求。
@@ -253,6 +265,13 @@ class Config:
         if allowed_hosts:
             self.http_allowed_hosts = allowed_hosts
 
+        token = env.get(ENV_PREFIX + "WEB_ACCESS_TOKEN")
+        if token and token.strip():
+            self.web_access_token = token.strip()
+        public_hosts = _env_list(ENV_PREFIX + "WEB_PUBLIC_HOSTS")
+        if public_hosts:
+            self.web_public_hosts = public_hosts
+
         enabled = _env_list(ENV_PREFIX + "ENABLED_TOOLS")
         if enabled:
             self.enabled_tools = enabled
@@ -321,10 +340,13 @@ class Config:
         return {key: value for key, value in asdict(self).items() if not key.startswith("_")}
 
     def describe(self) -> str:
-        """人类可读的配置摘要（--show-config），API Key 只显示尾部。"""
+        """人类可读的配置摘要（--show-config），密钥只显示尾部。"""
         data = self.to_dict()
+        # 三个都是秘密，三条都得脱敏。web_access_token 尤其容易漏想：
+        # 它跟 API Key 不一样，是**手输**的，多半是人顺手复用的那一串。
         data["api_key"] = _mask(self.api_key)
         data["search_api_key"] = _mask(self.search_api_key)
+        data["web_access_token"] = _mask(self.web_access_token)
         width = max(len(key) for key in data)
         return "\n".join(f"  {key.ljust(width)} : {value!r}" for key, value in data.items())
 

@@ -114,6 +114,7 @@ class HttpRequestTool(BaseTool):
         # 而响应体会原样作为工具结果回到模型手里。每一跳都重新过一遍 _check_url，
         # 跳转目标是谁给的都要过同一道闸。
         current, current_verb, current_payload = target, verb, payload
+        current_headers = dict(headers or {})
         try:
             with requests.Session() as session:
                 for _ in range(_MAX_REDIRECTS + 1):
@@ -121,7 +122,7 @@ class HttpRequestTool(BaseTool):
                     response = session.request(
                         current_verb,
                         current,
-                        headers=headers or {},
+                        headers=current_headers,
                         data=current_payload,
                         timeout=seconds,
                         allow_redirects=False,
@@ -130,7 +131,26 @@ class HttpRequestTool(BaseTool):
                     if response.status_code not in _REDIRECT_CODES or not location:
                         return self._format(response)
                     # 相对跳转（Location: /next）要接着上一跳的地址拼
-                    current = urljoin(current, location)
+                    next_url = urljoin(current, location)
+                    # **跨主机跳转不能带着凭据过去。** requests 自己跟跳转时有一套规则
+                    # （rebuild_auth：主机变了剥 Authorization，http→https 同主机保留），
+                    # 我们改成手动跟，这一步就得自己补上——否则一个 302 就能把调用方
+                    # 传进来的 Token 原样送到对方指定的主机。规则直接复用它的，
+                    # 不自己发明，免得和 allow_redirects=True 的行为对不上。
+                    # Cookie 同理：requests 每一跳都剥，改由 cookie jar 按域重放。
+                    try:
+                        strip_auth = session.should_strip_auth(current, next_url)
+                    except Exception:
+                        # 判断不了就按「要剥」处理：这条路上宁可少发一个头，
+                        # 也不能把 Token 送到一个判断不出来的地方。
+                        strip_auth = True
+                    drop = {"cookie"} | ({"authorization"} if strip_auth else set())
+                    current_headers = {
+                        name: value
+                        for name, value in current_headers.items()
+                        if name.lower() not in drop
+                    }
+                    current = next_url
                     if response.status_code == 303 or (
                         response.status_code in (301, 302) and current_verb not in ("GET", "HEAD")
                     ):

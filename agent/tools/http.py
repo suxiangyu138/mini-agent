@@ -151,12 +151,19 @@ class HttpRequestTool(BaseTool):
                         if name.lower() not in drop
                     }
                     current = next_url
-                    if response.status_code == 303 or (
-                        response.status_code in (301, 302) and current_verb not in ("GET", "HEAD")
-                    ):
+                    if response.status_code in (301, 302, 303):
                         # 301/302/303 按浏览器惯例降级成 GET 并丢掉请求体；
                         # 307/308 的语义是「原样重发」，方法与请求体都保持。
-                        current_verb, current_payload = "GET", None
+                        # 三个实体头一并剥掉（requests 也是这么做的）：留着它们会让
+                        # 一个已经没有 body 的 GET 顶着 application/json 发出去。
+                        drop |= {"content-length", "content-type", "transfer-encoding"}
+                        current_headers = {
+                            name: value
+                            for name, value in current_headers.items()
+                            if name.lower() not in drop
+                        }
+                        if current_verb not in ("GET", "HEAD"):
+                            current_verb, current_payload = "GET", None
                 raise ToolError(f"重定向次数过多（超过 {_MAX_REDIRECTS} 次）：{target}")
         except requests.Timeout as exc:
             raise ToolError(f"请求超时（{seconds:.0f} 秒）：{target}") from exc

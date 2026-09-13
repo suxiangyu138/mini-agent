@@ -107,6 +107,52 @@ def _env_list(name: str) -> list[str]:
     return [item.strip() for item in raw.replace(";", ",").split(",") if item.strip()]
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):  # JSON 里的 0 / 1
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes", "on", "y"):
+            return True
+        if lowered in ("0", "false", "no", "off", "n", ""):
+            return False
+    raise ValueError(f"要 true 或 false，收到 {value!r}")
+
+
+def _as_list(value: Any) -> list[str]:
+    """列表字段收两种写法：JSON 数组，或者逗号分隔的字符串。"""
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [item.strip() for item in value.replace(";", ",").split(",") if item.strip()]
+    raise ValueError(f"要一个列表，收到 {value!r}")
+
+
+def _coerce_config_value(value: Any, current: Any) -> Any:
+    """按字段**当前值的类型**收下配置文件里的值。
+
+    这里堵的是一个失败方向：``bool("false")`` 是 ``True``，所以手写配置里
+    ``"http_allow_private": "false"``（多打一对引号）会把 SSRF 防线**反向打开**，
+    ``"allow_file_write": "false"`` 同理。开关类的错误必须是不生效，不能是反向生效。
+    列表也一样：``"http_allowed_hosts": "example.com"`` 会被逐字符当成一个主机名。
+
+    类型推断用当前值而不是注解，是因为 ``from __future__ import annotations``
+    下注解是字符串，而且 ``float | None`` 这种联合类型本来也推不出个准数。
+    当前值是 ``None`` 的字段（目前只有 temperature）推不出来，原样收下。
+    """
+    if isinstance(current, bool):
+        return _as_bool(value)
+    if isinstance(current, list):
+        return _as_list(value)
+    if isinstance(current, int):
+        return int(value)
+    if isinstance(current, float):
+        return float(value)
+    return value
+
+
 @dataclass
 class Config:
     """全部配置项。字段名即 config.json 的键名，也是 MINI_AGENT_<大写> 环境变量的来源。"""
@@ -210,10 +256,16 @@ class Config:
         for key, value in data.items():
             if key.startswith("_"):
                 continue  # JSON 没有注释语法，下划线开头的键当注释用
-            if key in known:
-                setattr(self, key, value)
-            else:
+            if key not in known:
                 logger.warning("配置文件里有未知配置项 %r，已忽略", key)
+                continue
+            current = getattr(self, key)
+            try:
+                setattr(self, key, _coerce_config_value(value, current))
+            except (TypeError, ValueError) as exc:
+                # 收不下就退回默认值，不把坏值塞进去：宁可让这个开关不生效，
+                # 也不能让它带着一个错类型往下跑（bool("false") 那种反向生效）。
+                logger.warning("配置项 %r 的值不合适（%s），用默认值 %r", key, exc, current)
         logger.debug("已从 %s 载入配置", path)
 
     def _apply_env(self) -> None:

@@ -21,7 +21,7 @@ import json
 import logging
 import socket
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from .base import BaseTool, ToolError
 
@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 
 _ALLOWED_SCHEMES = ("http", "https")
 _ALLOWED_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD")
+
+#: 要自己处理的重定向状态码。交给 requests 自动跟随是不行的：它只看第一跳，
+#: 而一个 302 就足以把请求送到 127.0.0.1 或者 169.254.169.254（云元数据端点）。
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+
+#: 跟随上限，和 requests 的默认值一致。
+_MAX_REDIRECTS = 30
 
 #: RFC 2544 基准测试保留段。本机代理软件的 fake-ip 模式默认从这个段里发假地址。
 #: 对**域名解析结果**放行（那是占位地址，不是目的地，理由见模块文档）；
@@ -102,25 +109,41 @@ class HttpRequestTool(BaseTool):
         seconds = min(max(float(timeout or self.timeout), 1.0), 60.0)
         payload = body.encode("utf-8") if body else None
 
+        # 重定向**自己跟**，不交给 requests：allow_redirects=True 只认第一跳的检查结果，
+        # 一个 302 就足以把请求送到 127.0.0.1 或者 169.254.169.254（云元数据端点），
+        # 而响应体会原样作为工具结果回到模型手里。每一跳都重新过一遍 _check_url，
+        # 跳转目标是谁给的都要过同一道闸。
+        current, current_verb, current_payload = target, verb, payload
         try:
-            response = requests.request(
-                verb,
-                target,
-                headers=headers or {},
-                data=payload,
-                timeout=seconds,
-                allow_redirects=True,
-            )
+            with requests.Session() as session:
+                for _ in range(_MAX_REDIRECTS + 1):
+                    via_fake_ip = self._check_url(current)
+                    response = session.request(
+                        current_verb,
+                        current,
+                        headers=headers or {},
+                        data=current_payload,
+                        timeout=seconds,
+                        allow_redirects=False,
+                    )
+                    location = response.headers.get("Location")
+                    if response.status_code not in _REDIRECT_CODES or not location:
+                        return self._format(response)
+                    # 相对跳转（Location: /next）要接着上一跳的地址拼
+                    current = urljoin(current, location)
+                    if response.status_code == 303 or (
+                        response.status_code in (301, 302) and current_verb not in ("GET", "HEAD")
+                    ):
+                        # 301/302/303 按浏览器惯例降级成 GET 并丢掉请求体；
+                        # 307/308 的语义是「原样重发」，方法与请求体都保持。
+                        current_verb, current_payload = "GET", None
+                raise ToolError(f"重定向次数过多（超过 {_MAX_REDIRECTS} 次）：{target}")
         except requests.Timeout as exc:
             raise ToolError(f"请求超时（{seconds:.0f} 秒）：{target}") from exc
-        except requests.TooManyRedirects as exc:
-            raise ToolError(f"重定向次数过多：{target}") from exc
         except requests.RequestException as exc:
             raise ToolError(
                 f"请求失败：{type(exc).__name__}: {exc}{self._proxy_hint(via_fake_ip)}"
             ) from exc
-
-        return self._format(response)
 
     # ---------- 内部 ----------
 
@@ -141,8 +164,14 @@ class HttpRequestTool(BaseTool):
 
         # 主机名本身就是 IP 字面量：不经过 DNS，代理软件也改不了，所以要**先于白名单**判定。
         # 白名单是给「域名被 fake-ip 解析成假地址」这种情况用的，不该顺手把真内网地址也放进来。
+        #
+        # 先去掉尾点（``http://127.0.0.1./`` 是 ``127.0.0.1`` 的根域写法，DNS 里等价）。
+        # 不去的话 ipaddress 会拒收、把它当**域名**放去解析——而 fake-ip 代理正好会把它
+        # 解析成 198.18.x.x 占位地址，于是走下面「全是占位地址 → 放行」那条路，
+        # 字面量检查整个被绕过去（``_is_allowed_host`` 早就 rstrip 了，这里也得跟上）。
+        bare_host = host.rstrip(".")
         try:
-            literal = ipaddress.ip_address(host)
+            literal = ipaddress.ip_address(bare_host)
         except ValueError:
             literal = None
         if literal is not None:
